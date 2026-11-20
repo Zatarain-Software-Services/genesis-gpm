@@ -957,6 +957,126 @@ static int command_update(const char *alias) {
     return 0;
 }
 
+/* --- gpm tree --------------------------------------------------------- */
+
+/* Renders the flattened lockfile as a tree: manifest dependencies at the
+   root, each locked package's recorded dependencies underneath. Aliases
+   already expanded are marked "(deduped)" — this also makes cyclic
+   dependency edges terminate. */
+typedef struct {
+    GpmLockfile *lockfile;
+    char **expanded;
+    size_t expanded_count;
+} TreeContext;
+
+static bool tree_was_expanded(TreeContext *context, const char *alias) {
+    for (size_t index = 0; index < context->expanded_count; index++)
+        if (!strcmp(context->expanded[index], alias))
+            return true;
+    return false;
+}
+
+static bool tree_mark_expanded(TreeContext *context, const char *alias) {
+    char **grown = (char **)realloc(
+        context->expanded,
+        (context->expanded_count + 1) * sizeof(*context->expanded));
+    if (!grown)
+        return false;
+    context->expanded = grown;
+    context->expanded[context->expanded_count] = strdup(alias);
+    if (!context->expanded[context->expanded_count])
+        return false;
+    context->expanded_count++;
+    return true;
+}
+
+static void tree_print_node(TreeContext *context, const GpmDependency *dep,
+                            const char *prefix, bool last) {
+    printf("%s%s ", prefix, last ? "└──" : "├──");
+    GpmLockedPackage *package =
+        gpm_lockfile_find_package(context->lockfile, dep->alias);
+    if (!package) {
+        printf("%s %s (not installed)\n", dep->alias, dep->source);
+        return;
+    }
+    printf("%s@%s %s", package->alias,
+           package->version && *package->version ? package->version
+                                                 : "unknown",
+           package->source);
+    if (tree_was_expanded(context, dep->alias)) {
+        printf(" (deduped)\n");
+        return;
+    }
+    tree_mark_expanded(context, dep->alias);
+    printf("\n");
+    char *child_prefix =
+        malloc(strlen(prefix) + 8); /* "    " or "│   " (6 bytes) + NUL */
+    if (!child_prefix)
+        return;
+    strcpy(child_prefix, prefix);
+    strcat(child_prefix, last ? "    " : "│   ");
+    for (size_t index = 0; index < package->dependency_count; index++)
+        tree_print_node(context, &package->dependencies[index],
+                        child_prefix, index + 1 == package->dependency_count);
+    free(child_prefix);
+}
+
+static void tree_print_dependencies(TreeContext *context,
+                                    const GpmDependency *dependencies,
+                                    size_t count, const char *prefix) {
+    for (size_t index = 0; index < count; index++)
+        tree_print_node(context, &dependencies[index], prefix,
+                        index + 1 == count);
+}
+
+static int command_tree(void) {
+    char error[PKG_ERROR_SIZE];
+    GpmManifest *manifest =
+        gpm_manifest_load(GPM_MANIFEST_FILE, error, sizeof(error));
+    if (!manifest) {
+        pkg_error("%s", error);
+        return 1;
+    }
+    GpmLockfile *lockfile = load_lockfile_lenient(GPM_LOCKFILE_FILE);
+    if (!lockfile) {
+        pkg_error("Cannot read %s.", GPM_LOCKFILE_FILE);
+        gpm_manifest_free(manifest);
+        return 1;
+    }
+
+    printf("%s", manifest->name && *manifest->name ? manifest->name
+                                                  : "(unnamed)");
+    if (manifest->version && *manifest->version)
+        printf("@%s", manifest->version);
+    printf("\n");
+
+    TreeContext context = {lockfile, NULL, 0};
+    tree_print_dependencies(&context, manifest->dependencies,
+                            manifest->dependency_count, "");
+
+    /* Lockfile entries unreachable from the manifest are stale. */
+    size_t extraneous = 0;
+    for (size_t index = 0; index < lockfile->package_count; index++) {
+        GpmLockedPackage *package = &lockfile->packages[index];
+        if (tree_was_expanded(&context, package->alias))
+            continue;
+        if (!extraneous)
+            printf("Extraneous lockfile packages:\n");
+        printf("  %s@%s %s\n", package->alias,
+               package->version && *package->version ? package->version
+                                                     : "unknown",
+               package->source);
+        extraneous++;
+    }
+    for (size_t index = 0; index < context.expanded_count; index++)
+        free(context.expanded[index]);
+    free(context.expanded);
+
+    gpm_lockfile_free(lockfile);
+    gpm_manifest_free(manifest);
+    return 0;
+}
+
 static void usage(void) {
     fprintf(stderr,
             "Usage: gpm <command>\n"
@@ -973,6 +1093,8 @@ static void usage(void) {
             "the lockfile.\n"
             "  remove <alias>           Remove a dependency and its "
             "installed package.\n"
+            "  tree                     Print the dependency tree from "
+            "genesis.json/genesis.lock.json.\n"
             "\n"
             "See docs/package-manager.md for the package format.\n");
 }
@@ -987,6 +1109,8 @@ int main(int argument_count, char **argument_values) {
         return command_init();
     if (!strcmp(command, "check") && argument_count == 2)
         return command_check();
+    if (!strcmp(command, "tree") && argument_count == 2)
+        return command_tree();
     if (!strcmp(command, "remove") && argument_count == 3)
         return command_remove(argument_values[2]);
     if (!strcmp(command, "add") && argument_count >= 3)
