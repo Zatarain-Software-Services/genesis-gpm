@@ -76,6 +76,20 @@ static void *json_realloc_array(void *items, size_t count, size_t item_size) {
     return realloc(items, count * item_size);
 }
 
+bool json_array_add(JsonValue *array, JsonValue *item) {
+    if (!array || array->type != JSON_VALUE_ARRAY || !item)
+        return false;
+    JsonValue **resized = (JsonValue **)json_realloc_array(
+        array->items, array->item_count + 1, sizeof(*array->items));
+    if (!resized) {
+        json_value_free(item);
+        return false;
+    }
+    array->items = resized;
+    array->items[array->item_count++] = item;
+    return true;
+}
+
 static char *json_strdup_range(const char *start, size_t length) {
     char *copy = (char *)malloc(length + 1);
     if (!copy)

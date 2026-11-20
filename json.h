@@ -41,6 +41,9 @@ JsonValue *json_value_new(JsonValueType type);
 JsonValue *json_string_new(const char *text);
 JsonValue *json_number_new(const char *literal);
 bool json_object_add(JsonValue *object, const char *key, JsonValue *value);
+/* Appends item to a JSON_VALUE_ARRAY, taking ownership. Returns false on
+   allocation failure (item is freed). */
+bool json_array_add(JsonValue *array, JsonValue *item);
 
 /* Parses a complete JSON document. On failure returns NULL and writes a
    short diagnostic into error_buffer when it is non-NULL. */
