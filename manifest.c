@@ -242,8 +242,65 @@ static void manifest_free_dependencies(GpmDependency *dependencies,
     free(dependencies);
 }
 
+static void manifest_free_native_extensions(char **extensions,
+                                            size_t count);
+
+static bool manifest_parse_native_extensions(JsonValue *root,
+                                              char ***out,
+                                              size_t *out_count,
+                                              char *error_buffer,
+                                              size_t error_capacity) {
+    *out = NULL;
+    *out_count = 0;
+    const JsonValue *member = json_object_member(root, "nativeExtensions");
+    if (!member)
+        return true;
+    if (member->type != JSON_VALUE_ARRAY) {
+        manifest_set_error(error_buffer, error_capacity,
+                           "'nativeExtensions' must be an array of path "
+                           "strings.");
+        return false;
+    }
+    size_t count = member->item_count;
+    char **extensions = (char **)calloc(count ? count : 1, sizeof(*extensions));
+    if (!extensions) {
+        manifest_set_error(error_buffer, error_capacity,
+                           "Out of memory reading nativeExtensions.");
+        return false;
+    }
+    for (size_t index = 0; index < count; index++) {
+        const JsonValue *item = member->items[index];
+        if (item->type != JSON_VALUE_STRING || !item->string[0]) {
+            manifest_free_native_extensions(extensions, index);
+            manifest_set_error(error_buffer, error_capacity,
+                               "'nativeExtensions' entries must be non-empty "
+                               "path strings.");
+            return false;
+        }
+        extensions[index] = manifest_strdup(item->string);
+        if (!extensions[index]) {
+            manifest_free_native_extensions(extensions, index);
+            manifest_set_error(error_buffer, error_capacity,
+                           "Out of memory reading nativeExtensions.");
+            return false;
+        }
+    }
+    *out = extensions;
+    *out_count = count;
+    return true;
+}
+
 GpmManifest *gpm_manifest_new(void) {
     return (GpmManifest *)calloc(1, sizeof(GpmManifest));
+}
+
+static void manifest_free_native_extensions(char **extensions,
+                                            size_t count) {
+    if (!extensions)
+        return;
+    for (size_t index = 0; index < count; index++)
+        free(extensions[index]);
+    free(extensions);
 }
 
 void gpm_manifest_free(GpmManifest *manifest) {
@@ -254,6 +311,8 @@ void gpm_manifest_free(GpmManifest *manifest) {
     free(manifest->entry);
     manifest_free_dependencies(manifest->dependencies,
                              manifest->dependency_count);
+    manifest_free_native_extensions(manifest->native_extensions,
+                                    manifest->native_extension_count);
     free(manifest);
 }
 
@@ -315,7 +374,10 @@ GpmManifest *gpm_manifest_load(const char *path,
               manifest_parse_dependencies(
                   json_dependencies_object(root, "dependencies"),
                   &manifest->dependencies, &manifest->dependency_count,
-                  error_buffer, error_capacity);
+                  error_buffer, error_capacity) &&
+              manifest_parse_native_extensions(root, &manifest->native_extensions,
+                                               &manifest->native_extension_count,
+                                               error_buffer, error_capacity);
     json_value_free(root);
     if (!ok) {
         gpm_manifest_free(manifest);
@@ -379,6 +441,24 @@ bool gpm_manifest_save(const GpmManifest *manifest,
             ok = json_object_add(root, "dependencies", dependencies);
         else
             ok = false;
+    }
+    if (ok && manifest->native_extension_count) {
+        JsonValue *extensions = json_value_new(JSON_VALUE_ARRAY);
+        if (extensions) {
+            for (size_t index = 0; index < manifest->native_extension_count &&
+                                  ok;
+                 index++) {
+                ok = json_array_add(extensions,
+                                    json_string_new(
+                                        manifest->native_extensions[index]));
+            }
+        }
+        if (extensions && ok)
+            ok = json_object_add(root, "nativeExtensions", extensions);
+        else {
+            json_value_free(extensions);
+            ok = false;
+        }
     }
     if (ok)
         ok = json_write_file(root, path, error_buffer, error_capacity);

@@ -18,6 +18,13 @@ typedef struct {
     char *entry;
     GpmDependency *dependencies;
     size_t dependency_count;
+    /* Optional native extension library paths, relative to the manifest
+       directory (or absolute). gpm never fetches or installs these; the
+       project author maintains them manually. The runtime/CLI/LSP load
+       the listed files so their registered type signatures are visible
+       to the checker. */
+    char **native_extensions;
+    size_t native_extension_count;
 } GpmManifest;
 
 typedef struct {
