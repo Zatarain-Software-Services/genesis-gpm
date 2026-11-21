@@ -516,8 +516,8 @@ static bool gpm_resolve_and_install(const char *alias, const char *source_spec,
         if (!gpm_source_parse(existing->source, &pinned, parse_error,
                               sizeof(parse_error))) {
             snprintf(ctx->error, sizeof(ctx->error),
-                     "Lockfile source for '%s' is invalid: %s", alias,
-                     parse_error);
+                     "Lockfile source for '%.200s' is invalid: %.250s",
+                     alias, parse_error);
             return false;
         }
         GpmSource requested;
@@ -580,7 +580,8 @@ static bool gpm_resolve_and_install(const char *alias, const char *source_spec,
     pkg_remove_tree(staging_dir);
     if (!pkg_ensure_dir(staging_dir)) {
         snprintf(ctx->error, sizeof(ctx->error),
-                 "Could not create staging directory '%s'.", staging_dir);
+                 "Could not create staging directory '%.440s'.",
+                 staging_dir);
         gpm_source_free(&source);
         return false;
     }
@@ -599,7 +600,7 @@ static bool gpm_resolve_and_install(const char *alias, const char *source_spec,
         return false;
     }
     /* Load the fetched manifest for version and dependency flattening. */
-    char manifest_path[4096];
+    char manifest_path[8192];
     snprintf(manifest_path, sizeof(manifest_path), "%s/%s", staging_dir,
              GPM_MANIFEST_FILE);
     GpmManifest *package_manifest =
