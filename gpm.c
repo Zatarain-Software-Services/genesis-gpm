@@ -15,6 +15,8 @@
 #include <direct.h>
 #include <io.h>
 #include <sys/stat.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #define gpm_mkdir(path) _mkdir(path)
 #define gpm_strdup(text) _strdup(text)
 #else
@@ -93,10 +95,37 @@ static bool pkg_is_dir(const char *path) {
 
 #if defined(_WIN32)
 static bool pkg_remove_tree(const char *path) {
-    (void)path;
-    pkg_error("Recursive package removal is not yet supported on Windows.",
-              NULL);
-    return false;
+    char pattern[4096];
+    if (!pkg_path_join(pattern, sizeof(pattern), path, "*"))
+        return false;
+    WIN32_FIND_DATAA entry;
+    HANDLE handle = FindFirstFileA(pattern, &entry);
+    if (handle == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_FILE_NOT_FOUND ||
+               GetLastError() == ERROR_PATH_NOT_FOUND;
+    bool ok = true;
+    do {
+        if (!strcmp(entry.cFileName, ".") || !strcmp(entry.cFileName, ".."))
+            continue;
+        char child[4096];
+        if (!pkg_path_join(child, sizeof(child), path, entry.cFileName)) {
+            ok = false;
+            break;
+        }
+        if (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!pkg_remove_tree(child)) {
+                ok = false;
+                break;
+            }
+        } else if (!DeleteFileA(child)) {
+            ok = false;
+            break;
+        }
+    } while (FindNextFileA(handle, &entry));
+    FindClose(handle);
+    if (ok && !RemoveDirectoryA(path))
+        ok = false;
+    return ok;
 }
 #else
 static bool pkg_remove_tree(const char *path) {
@@ -263,7 +292,8 @@ static int command_remove(const char *alias) {
     char package_path[4096];
     if (pkg_path_join(package_path, sizeof(package_path),
                      GPM_PACKAGES_DIR, alias) &&
-        pkg_file_exists(package_path) && !pkg_remove_tree(package_path)) {
+        (pkg_file_exists(package_path) || pkg_is_dir(package_path)) &&
+        !pkg_remove_tree(package_path)) {
         pkg_error("Removed '%s' from %s and %s, but could not delete '%s'.",
                   alias, GPM_MANIFEST_FILE, GPM_LOCKFILE_FILE,
                   package_path);
