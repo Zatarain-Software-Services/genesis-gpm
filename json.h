@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdio.h>
 
+#include "platform.h"
+
 #define JSON_ERROR_SIZE 160
 
 typedef enum {
@@ -37,29 +39,29 @@ struct JsonValue {
 
 /* Constructors for building documents. json_object_add takes ownership of
    key (copied) and value. */
-JsonValue *json_value_new(JsonValueType type);
-JsonValue *json_string_new(const char *text);
-JsonValue *json_number_new(const char *literal);
-bool json_object_add(JsonValue *object, const char *key, JsonValue *value);
+GENESIS_API JsonValue *json_value_new(JsonValueType type);
+GENESIS_API JsonValue *json_string_new(const char *text);
+GENESIS_API JsonValue *json_number_new(const char *literal);
+GENESIS_API bool json_object_add(JsonValue *object, const char *key, JsonValue *value);
 /* Appends item to a JSON_VALUE_ARRAY, taking ownership. Returns false on
    allocation failure (item is freed). */
-bool json_array_add(JsonValue *array, JsonValue *item);
+GENESIS_API bool json_array_add(JsonValue *array, JsonValue *item);
 
 /* Parses a complete JSON document. On failure returns NULL and writes a
    short diagnostic into error_buffer when it is non-NULL. */
-JsonValue *json_parse(const char *text, char *error_buffer,
+GENESIS_API JsonValue *json_parse(const char *text, char *error_buffer,
                       size_t error_capacity);
-JsonValue *json_parse_file(const char *path, char *error_buffer,
+GENESIS_API JsonValue *json_parse_file(const char *path, char *error_buffer,
                            size_t error_capacity);
-void json_value_free(JsonValue *value);
+GENESIS_API void json_value_free(JsonValue *value);
 
 /* Returns the member with the exact key, or NULL. Only meaningful for
    JSON_VALUE_OBJECT values. */
-const JsonValue *json_object_member(const JsonValue *object, const char *key);
+GENESIS_API const JsonValue *json_object_member(const JsonValue *object, const char *key);
 
 /* Serializes the value. pretty=true emits the two-space indented form used
    for genesis.json and genesis.lock.json. Returns false on allocation or
    stream failure. */
-bool json_write(const JsonValue *value, FILE *stream, bool pretty);
+GENESIS_API bool json_write(const JsonValue *value, FILE *stream, bool pretty);
 
 #endif
