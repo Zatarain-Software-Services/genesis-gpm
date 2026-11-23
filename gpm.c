@@ -2,10 +2,13 @@
    Slices 1-3 provide init, check, remove, add, install, and update per
    docs/package-manager.md. Runtime @pkg/ specifier support arrives later. */
 
+#include "json.h"
 #include "manifest.h"
+#include "registry.h"
 #include "resolver.h"
 #include "signing.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -564,7 +567,8 @@ static bool pkg_install_staged(const char *alias, const char *staging_dir,
    instead of reused. Mutates ctx->lockfile only; callers save on success. */
 static bool gpm_resolve_and_install(const char *alias, const char *source_spec,
                                     struct ResolveContext *ctx, bool refresh,
-                                    int depth) {
+                                    int depth,
+                                    const char *provided_signature) {
     if (depth > GPM_MAX_DEPTH) {
         snprintf(ctx->error, sizeof(ctx->error),
                  "Dependency chain for '%s' exceeds %d levels; possible "
@@ -685,8 +689,14 @@ static bool gpm_resolve_and_install(const char *alias, const char *source_spec,
         free(previous_signature);
         return false;
     }
+    /* A signature supplied by the registry document sits between a live
+       sidecar fetch and the previously pinned lockfile signature: it is
+       fresher than the lockfile but the sidecar remains authoritative
+       when the host publishes one. */
     const char *signature_text =
-        fetched_signature ? fetched_signature : previous_signature;
+        fetched_signature ? fetched_signature
+                          : provided_signature ? provided_signature
+                                               : previous_signature;
     /* Load the fetched manifest for version and dependency flattening. */
     char manifest_path[8192];
     snprintf(manifest_path, sizeof(manifest_path), "%s/%s", staging_dir,
@@ -779,7 +789,7 @@ static bool gpm_resolve_and_install(const char *alias, const char *source_spec,
     for (size_t index = 0; index < dependency_count; index++) {
         if (!gpm_resolve_and_install(dependencies[index].alias,
                                      dependencies[index].source, ctx,
-                                     false, depth + 1)) {
+                                     false, depth + 1, NULL)) {
             for (size_t freed = 0; freed < dependency_count; freed++)
                 gpm_dependency_free_fields(&dependencies[freed]);
             free(dependencies);
@@ -793,12 +803,20 @@ static bool gpm_resolve_and_install(const char *alias, const char *source_spec,
 }
 
 static int command_add(int argument_count, char **argument_values) {
-    const char *source_spec = argument_values[2];
+    const char *requested = argument_values[2];
     const char *alias = NULL;
+    const char *version = NULL;
+    const char *registry_override = NULL;
     for (int index = 3; index < argument_count; index++) {
         if (!strcmp(argument_values[index], "--alias") && index + 1 <
                                                        argument_count)
             alias = argument_values[++index];
+        else if (!strcmp(argument_values[index], "--version") &&
+                 index + 1 < argument_count)
+            version = argument_values[++index];
+        else if (!strcmp(argument_values[index], "--registry") &&
+                 index + 1 < argument_count)
+            registry_override = argument_values[++index];
         else {
             pkg_error("Unknown argument '%s'.", argument_values[index]);
             return 1;
@@ -816,11 +834,56 @@ static int command_add(int argument_count, char **argument_values) {
         gpm_manifest_free(manifest);
         return 1;
     }
+
+    /* A specifier starting with 'github:' is a direct source; anything
+       else is a registry alias resolved through the configured registry
+       (docs/registry.md). The manifest records the resolved github:
+       source either way — the registry is discovery-only. */
+    bool registry_lookup = strncmp(requested, "github:", 7) != 0;
+    const char *source_spec = requested;
+    char *resolved_source = NULL;
+    char *resolved_signature = NULL;
+    if (registry_lookup) {
+        if (version && !*version) {
+            pkg_error("--version requires a version string.");
+            gpm_manifest_free(manifest);
+            return 1;
+        }
+        if (!alias)
+            alias = requested;
+        char registry_base[2048];
+        if (!gpm_registry_base_url(registry_override, manifest->registry,
+                                   registry_base, sizeof(registry_base))) {
+            pkg_error("No registry configured for '%s'; pass --registry, "
+                      "set GPM_REGISTRY_URL, or add \"registry\" to %s.",
+                      requested, GPM_MANIFEST_FILE);
+            gpm_manifest_free(manifest);
+            return 1;
+        }
+        if (!gpm_registry_resolve(registry_base, requested, version,
+                                  &resolved_source, &resolved_signature,
+                                  error, sizeof(error))) {
+            pkg_error("%s", error[0] ? error : "Registry resolution failed.");
+            gpm_manifest_free(manifest);
+            return 1;
+        }
+        source_spec = resolved_source;
+    } else if (version) {
+        pkg_error("--version only applies to registry aliases, not "
+                  "'github:' sources.");
+        gpm_manifest_free(manifest);
+        return 1;
+    }
+
     /* Default alias: the repository name when it already satisfies the
-       alias rules; otherwise the user must pass --alias. */
-    GpmSource parsed;
-    if (!gpm_source_parse(source_spec, &parsed, error, sizeof(error))) {
+       alias rules; otherwise the user must pass --alias. Registry
+       lookups already carry an explicit alias. */
+    GpmSource parsed = {0};
+    if (!registry_lookup &&
+        !gpm_source_parse(source_spec, &parsed, error, sizeof(error))) {
         pkg_error("%s", error);
+        free(resolved_source);
+        free(resolved_signature);
         gpm_manifest_free(manifest);
         return 1;
     }
@@ -831,6 +894,8 @@ static int command_add(int argument_count, char **argument_values) {
             pkg_error("Cannot derive an alias from '%s'; pass --alias.",
                       parsed.repo);
             gpm_source_free(&parsed);
+            free(resolved_source);
+            free(resolved_signature);
             gpm_manifest_free(manifest);
             return 1;
         }
@@ -846,20 +911,27 @@ static int command_add(int argument_count, char **argument_values) {
             derived[--last] = '\0';
         alias = derived;
     }
-    gpm_source_free(&parsed);
+    if (!registry_lookup)
+        gpm_source_free(&parsed);
     if (!gpm_alias_valid(alias)) {
         pkg_error("Invalid package alias '%s'.", alias);
+        free(resolved_source);
+        free(resolved_signature);
         gpm_manifest_free(manifest);
         return 1;
     }
     if (gpm_manifest_find_dependency(manifest, alias)) {
         pkg_error("%s already declares dependency '%s'.", GPM_MANIFEST_FILE,
                   alias);
+        free(resolved_source);
+        free(resolved_signature);
         gpm_manifest_free(manifest);
         return 1;
     }
     GpmLockfile *lockfile = load_lockfile_lenient(GPM_LOCKFILE_FILE);
     if (!lockfile) {
+        free(resolved_source);
+        free(resolved_signature);
         gpm_manifest_free(manifest);
         return 1;
     }
@@ -868,10 +940,13 @@ static int command_add(int argument_count, char **argument_values) {
     context.lockfile = lockfile;
     context.package_trust = pkg_effective_trust(
         &manifest->package_trust, &lockfile->package_trust);
-    if (!gpm_resolve_and_install(alias, source_spec, &context, false, 0)) {
+    if (!gpm_resolve_and_install(alias, source_spec, &context, false, 0,
+                                 resolved_signature)) {
         pkg_error("%s", context.error[0] ? context.error
                                           : "Resolution failed.");
         gpm_lockfile_free(lockfile);
+        free(resolved_source);
+        free(resolved_signature);
         gpm_manifest_free(manifest);
         return 1;
     }
@@ -883,12 +958,236 @@ static int command_add(int argument_count, char **argument_values) {
                            sizeof(error))) {
         pkg_error("%s", error[0] ? error : "Out of memory.");
         gpm_lockfile_free(lockfile);
+        free(resolved_source);
+        free(resolved_signature);
         gpm_manifest_free(manifest);
         return 1;
     }
     gpm_lockfile_free(lockfile);
     gpm_manifest_free(manifest);
     printf("Added %s (%s)\n", alias, source_spec);
+    free(resolved_source);
+    free(resolved_signature);
+    return 0;
+}
+
+/* Loads genesis.json leniently for registry commands: a missing or
+   invalid manifest only means no "registry" field, not a hard error —
+   --registry and GPM_REGISTRY_URL still apply. */
+static GpmManifest *pkg_manifest_for_registry(void) {
+    char error[PKG_ERROR_SIZE];
+    GpmManifest *manifest =
+        gpm_manifest_load(GPM_MANIFEST_FILE, error, sizeof(error));
+    if (manifest &&
+        !gpm_manifest_validate(manifest, error, sizeof(error))) {
+        gpm_manifest_free(manifest);
+        return NULL;
+    }
+    return manifest;
+}
+
+static bool pkg_registry_base_or_error(const char *override,
+                                       GpmManifest *manifest, char *out,
+                                       size_t capacity) {
+    if (gpm_registry_base_url(override,
+                              manifest ? manifest->registry : NULL, out,
+                              capacity))
+        return true;
+    pkg_error("No registry configured; pass --registry, set "
+              "GPM_REGISTRY_URL, or add \"registry\" to %s.",
+              GPM_MANIFEST_FILE);
+    return false;
+}
+
+static const char *pkg_json_string(const JsonValue *object,
+                                   const char *key) {
+    const JsonValue *member = json_object_member(object, key);
+    if (!member || member->type != JSON_VALUE_STRING || !member->string)
+        return NULL;
+    return member->string;
+}
+
+static bool pkg_json_fetch(const char *base, const char *path,
+                           JsonValue **document_out, char *error,
+                           size_t error_capacity) {
+    char *text = NULL;
+    if (!gpm_registry_fetch_document(base, path, &text, error,
+                                     error_capacity))
+        return false;
+    char json_error[JSON_ERROR_SIZE];
+    JsonValue *document = json_parse(text, json_error, sizeof(json_error));
+    free(text);
+    if (!document) {
+        snprintf(error, error_capacity,
+                 "Registry document '%s' is not valid JSON: %s", path,
+                 json_error);
+        return false;
+    }
+    if (document->type != JSON_VALUE_OBJECT) {
+        json_value_free(document);
+        snprintf(error, error_capacity,
+                 "Registry document '%s' must be a JSON object.", path);
+        return false;
+    }
+    *document_out = document;
+    return true;
+}
+
+static int command_info(int argument_count, char **argument_values) {
+    const char *alias = argument_values[2];
+    const char *registry_override = NULL;
+    for (int index = 3; index < argument_count; index++) {
+        if (!strcmp(argument_values[index], "--registry") && index + 1 <
+                                                       argument_count)
+            registry_override = argument_values[++index];
+        else {
+            pkg_error("Unknown argument '%s'.", argument_values[index]);
+            return 1;
+        }
+    }
+    if (!gpm_alias_valid(alias)) {
+        pkg_error("Invalid package alias '%s'.", alias);
+        return 1;
+    }
+    GpmManifest *manifest = pkg_manifest_for_registry();
+    char base[2048];
+    if (!pkg_registry_base_or_error(registry_override, manifest, base,
+                                    sizeof(base))) {
+        if (manifest)
+            gpm_manifest_free(manifest);
+        return 1;
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "packages/%s.json", alias);
+    char error[PKG_ERROR_SIZE];
+    JsonValue *document = NULL;
+    if (!pkg_json_fetch(base, path, &document, error, sizeof(error))) {
+        pkg_error("%s", error[0] ? error : "Registry lookup failed.");
+        if (manifest)
+            gpm_manifest_free(manifest);
+        return 1;
+    }
+    const char *name = pkg_json_string(document, "name");
+    const char *description = pkg_json_string(document, "description");
+    const char *license = pkg_json_string(document, "license");
+    const char *homepage = pkg_json_string(document, "homepage");
+    const char *latest = pkg_json_string(document, "latest");
+    printf("%s\n", name ? name : alias);
+    if (description)
+        printf("  %s\n", description);
+    if (license)
+        printf("  license: %s\n", license);
+    if (homepage)
+        printf("  homepage: %s\n", homepage);
+    if (latest)
+        printf("  latest: %s\n", latest);
+    const JsonValue *versions = json_object_member(document, "versions");
+    if (versions && versions->type == JSON_VALUE_ARRAY) {
+        printf("  versions:\n");
+        for (size_t index = 0; index < versions->item_count; index++) {
+            const JsonValue *entry = versions->items[index];
+            const char *version =
+                entry->type == JSON_VALUE_OBJECT
+                    ? pkg_json_string(entry, "version")
+                    : NULL;
+            const char *source =
+                entry->type == JSON_VALUE_OBJECT
+                    ? pkg_json_string(entry, "source")
+                    : NULL;
+            if (version)
+                printf("    %s%s%s\n", version, source ? "  " : "",
+                       source ? source : "");
+        }
+    }
+    json_value_free(document);
+    if (manifest)
+        gpm_manifest_free(manifest);
+    return 0;
+}
+
+static bool pkg_contains_fold(const char *haystack, const char *needle) {
+    if (!haystack || !needle)
+        return false;
+    size_t needle_length = strlen(needle);
+    if (!needle_length)
+        return true;
+    for (const char *cursor = haystack; *cursor; cursor++) {
+        size_t index = 0;
+        while (index < needle_length && cursor[index] &&
+               tolower((unsigned char)cursor[index]) ==
+                   tolower((unsigned char)needle[index]))
+            index++;
+        if (index == needle_length)
+            return true;
+    }
+    return false;
+}
+
+static int command_search(int argument_count, char **argument_values) {
+    if (argument_count < 3) {
+        pkg_error("Usage: gpm search <query> [--registry <url>]");
+        return 1;
+    }
+    const char *query = argument_values[2];
+    const char *registry_override = NULL;
+    for (int index = 3; index < argument_count; index++) {
+        if (!strcmp(argument_values[index], "--registry") && index + 1 <
+                                                       argument_count)
+            registry_override = argument_values[++index];
+        else {
+            pkg_error("Unknown argument '%s'.", argument_values[index]);
+            return 1;
+        }
+    }
+    GpmManifest *manifest = pkg_manifest_for_registry();
+    char base[2048];
+    if (!pkg_registry_base_or_error(registry_override, manifest, base,
+                                    sizeof(base))) {
+        if (manifest)
+            gpm_manifest_free(manifest);
+        return 1;
+    }
+    char error[PKG_ERROR_SIZE];
+    JsonValue *document = NULL;
+    if (!pkg_json_fetch(base, "index.json", &document, error,
+                        sizeof(error))) {
+        pkg_error("%s", error[0] ? error : "Registry lookup failed.");
+        if (manifest)
+            gpm_manifest_free(manifest);
+        return 1;
+    }
+    const JsonValue *packages = json_object_member(document, "packages");
+    size_t matches = 0;
+    if (packages && packages->type == JSON_VALUE_ARRAY) {
+        for (size_t index = 0; index < packages->item_count; index++) {
+            const JsonValue *entry = packages->items[index];
+            if (entry->type != JSON_VALUE_OBJECT)
+                continue;
+            const char *alias = pkg_json_string(entry, "alias");
+            const char *name = pkg_json_string(entry, "name");
+            const char *description =
+                pkg_json_string(entry, "description");
+            const char *latest = pkg_json_string(entry, "latest");
+            if (!pkg_contains_fold(alias, query) &&
+                !pkg_contains_fold(name, query) &&
+                !pkg_contains_fold(description, query))
+                continue;
+            matches++;
+            printf("%s", alias ? alias : "(unnamed)");
+            if (name && strcmp(name, alias ? alias : ""))
+                printf(" (%s)", name);
+            if (description)
+                printf(" — %s", description);
+            if (latest)
+                printf(" [latest %s]", latest);
+            putchar('\n');
+        }
+    }
+    json_value_free(document);
+    if (manifest)
+        gpm_manifest_free(manifest);
+    if (!matches)
+        printf("No packages matching '%s'.\n", query);
     return 0;
 }
 
@@ -963,7 +1262,7 @@ static int command_install(int argument_count, char **argument_values) {
                 continue;
             if (!gpm_resolve_and_install(dependency->alias,
                                          dependency->source, &context,
-                                         false, 0)) {
+                                         false, 0, NULL)) {
                 pkg_error("%s", context.error[0] ? context.error
                                                   : "Resolution failed.");
                 gpm_lockfile_free(lockfile);
@@ -1094,7 +1393,7 @@ static int command_update(const char *alias) {
         if (alias && strcmp(dependency->alias, alias))
             continue;
         if (!gpm_resolve_and_install(dependency->alias, dependency->source,
-                                     &context, true, 0)) {
+                                     &context, true, 0, NULL)) {
             pkg_error("%s", context.error[0] ? context.error
                                               : "Resolution failed.");
             gpm_lockfile_free(lockfile);
@@ -1564,8 +1863,16 @@ static void usage(void) {
             "  init                     Create a starter genesis.json manifest.\n"
             "  check                    Validate genesis.json and "
             "genesis.lock.json.\n"
-            "  add <source> [--alias a] Resolve, verify, and install a "
-            "github:owner/repo[@ref] package.\n"
+            "  add <source> [--alias a] [--version v] [--registry u]\n"
+            "                          Resolve, verify, and install a "
+            "github:owner/repo[@ref] package, or a registry alias when "
+            "a registry is configured.\n"
+            "  info <alias> [--registry u]\n"
+            "                          Show registry metadata and "
+            "versions for a package.\n"
+            "  search <query> [--registry u]\n"
+            "                          Search the configured registry's "
+            "package index.\n"
             "  install [--frozen]      Materialize packages pinned in "
             "genesis.lock.json.\n"
             "  update [alias]          Re-resolve specifiers and rewrite "
@@ -1603,6 +1910,10 @@ int main(int argument_count, char **argument_values) {
         return command_remove(argument_values[2]);
     if (!strcmp(command, "add") && argument_count >= 3)
         return command_add(argument_count, argument_values);
+    if (!strcmp(command, "info") && argument_count >= 3)
+        return command_info(argument_count, argument_values);
+    if (!strcmp(command, "search") && argument_count >= 3)
+        return command_search(argument_count, argument_values);
     if (!strcmp(command, "install") && argument_count >= 2)
         return command_install(argument_count, argument_values);
     if (!strcmp(command, "update") && argument_count <= 3)

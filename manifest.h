@@ -45,6 +45,10 @@ typedef struct {
        to the checker. */
     char **native_extensions;
     size_t native_extension_count;
+    /* Optional package registry base URL used by `gpm add <alias>`,
+       `gpm info`, and `gpm search` to discover packages (docs/registry.md).
+       GPM_REGISTRY_URL and the --registry flag override it. */
+    char *registry;
     /* Optional package signing trust: trustedPackageKeys maps a keyId to
        a base64url public key; signedPackagesRequired makes a missing or
        invalid package signature a hard error. Both default to absent. */

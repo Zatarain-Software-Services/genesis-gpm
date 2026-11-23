@@ -477,6 +477,80 @@ static char *resolver_read_text_file(const char *path, size_t *length_out) {
     return text;
 }
 
+/* Fetches url via curl and returns the body as a malloc'd string. The
+   capture buffer grows on demand so index/package documents of any
+   reasonable size work without a fixed cap. */
+bool gpm_fetch_text_url(const char *url, char **out_text,
+                        char *error_buffer, size_t error_capacity) {
+    *out_text = NULL;
+    int pipe_fds[2];
+    if (pipe(pipe_fds) != 0) {
+        resolver_error(error_buffer, error_capacity,
+                       "Could not create a pipe for 'curl'.");
+        return false;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        resolver_error(error_buffer, error_capacity,
+                       "Could not start 'curl'.");
+        return false;
+    }
+    if (child == 0) {
+        dup2(pipe_fds[1], STDOUT_FILENO);
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        char *curl_argv[] = {"curl", "-fsSL", (char *)url, NULL};
+        execvp("curl", curl_argv);
+        _exit(127);
+    }
+    close(pipe_fds[1]);
+    size_t capacity = 8192;
+    size_t used = 0;
+    char *body = (char *)malloc(capacity);
+    if (!body) {
+        close(pipe_fds[0]);
+        resolver_error(error_buffer, error_capacity, "Out of memory.");
+        return false;
+    }
+    char chunk[8192];
+    for (;;) {
+        ssize_t received = read(pipe_fds[0], chunk, sizeof(chunk));
+        if (received <= 0)
+            break;
+        if (used + (size_t)received + 1 > capacity) {
+            while (used + (size_t)received + 1 > capacity)
+                capacity *= 2;
+            char *grown = (char *)realloc(body, capacity);
+            if (!grown) {
+                free(body);
+                close(pipe_fds[0]);
+                resolver_error(error_buffer, error_capacity,
+                               "Out of memory.");
+                return false;
+            }
+            body = grown;
+        }
+        memcpy(body + used, chunk, (size_t)received);
+        used += (size_t)received;
+    }
+    close(pipe_fds[0]);
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR)
+        ;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        free(body);
+        resolver_error(error_buffer, error_capacity,
+                       "Could not fetch '%s' (curl exit status %d).", url,
+                       WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return false;
+    }
+    body[used] = '\0';
+    *out_text = body;
+    return true;
+}
+
 bool gpm_fetch_package_signature(const GpmSource *source,
                                  const char *commit,
                                  const char *staging_dir,
@@ -505,7 +579,9 @@ bool gpm_fetch_package_signature(const GpmSource *source,
                        "Signature URL is too long.");
         return false;
     }
-    char *download_argv[] = {"curl", "-fsSL", "-o", sig_path, url, NULL};
+    /* -s without -S keeps curl fully silent: a missing sidecar is normal
+       (unsigned package), not a user-facing error. */
+    char *download_argv[] = {"curl", "-fsL", "-o", sig_path, url, NULL};
     /* curl exits non-zero for a missing sidecar; that simply means the
        package is unsigned, so any failure leaves envelope_out NULL. */
     resolver_run_capture(download_argv, NULL, 0, NULL, 0);
@@ -567,6 +643,14 @@ bool gpm_fetch_package(const GpmSource *source, const char *commit,
     (void)expected_sha256;
     (void)staging_dir;
     (void)actual_sha256_out;
+    resolver_unsupported(error_buffer, error_capacity);
+    return false;
+}
+
+bool gpm_fetch_text_url(const char *url, char **out_text,
+                        char *error_buffer, size_t error_capacity) {
+    (void)url;
+    *out_text = NULL;
     resolver_unsupported(error_buffer, error_capacity);
     return false;
 }

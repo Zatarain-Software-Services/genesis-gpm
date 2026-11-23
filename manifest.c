@@ -145,12 +145,13 @@ bool gpm_source_valid(const char *source, char *reason,
         char character = rest[index];
         if (character == '/')
             continue;
-        if (!islower((unsigned char)character) &&
-            !isdigit((unsigned char)character) && character != '-' &&
+        /* GitHub owner/repository names are case-insensitive and permit
+           uppercase; git and codeload resolve them as given. */
+        if (!isalnum((unsigned char)character) && character != '-' &&
             character != '_' && character != '.') {
             manifest_set_error(reason, reason_capacity,
                                "GitHub owner/repository names may only contain "
-                               "lowercase letters, digits, '-', '_', and '.'.");
+                               "letters, digits, '-', '_', and '.'.");
             return false;
         }
     }
@@ -460,6 +461,7 @@ void gpm_manifest_free(GpmManifest *manifest) {
     free(manifest->name);
     free(manifest->version);
     free(manifest->entry);
+    free(manifest->registry);
     manifest_free_dependencies(manifest->dependencies,
                              manifest->dependency_count);
     manifest_free_native_extensions(manifest->native_extensions,
@@ -523,6 +525,8 @@ GpmManifest *gpm_manifest_load(const char *path,
                                      error_buffer, error_capacity) &&
               manifest_member_string(root, "entry", &manifest->entry, false,
                                      error_buffer, error_capacity) &&
+              manifest_member_string(root, "registry", &manifest->registry,
+                                     false, error_buffer, error_capacity) &&
               manifest_parse_dependencies(
                   json_dependencies_object(root, "dependencies"),
                   &manifest->dependencies, &manifest->dependency_count,
@@ -589,6 +593,9 @@ bool gpm_manifest_save(const GpmManifest *manifest,
                               json_string_new(manifest->version));
     if (ok && manifest->entry)
         ok = json_object_add(root, "entry", json_string_new(manifest->entry));
+    if (ok && manifest->registry)
+        ok = json_object_add(root, "registry",
+                             json_string_new(manifest->registry));
     if (ok && manifest->dependency_count) {
         JsonValue *dependencies = json_build_dependencies(
             manifest->dependencies, manifest->dependency_count);
@@ -649,6 +656,11 @@ bool gpm_manifest_validate(const GpmManifest *manifest,
     if (manifest->entry && !manifest->entry[0]) {
         manifest_set_error(error_buffer, error_capacity,
                            "Manifest 'entry' may not be empty.");
+        return false;
+    }
+    if (manifest->registry && !manifest->registry[0]) {
+        manifest_set_error(error_buffer, error_capacity,
+                           "Manifest 'registry' may not be empty.");
         return false;
     }
     for (size_t index = 0; index < manifest->dependency_count; index++) {

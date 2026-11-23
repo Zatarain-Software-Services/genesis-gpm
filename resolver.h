@@ -35,6 +35,13 @@ bool gpm_fetch_package(const GpmSource *source, const char *commit,
                        char *actual_sha256_out, char *error_buffer,
                        size_t error_capacity);
 
+/* Fetches a URL (http(s) or file://) with `curl -fsSL` and returns the
+   response body as a malloc'd NUL-terminated string in *out_text
+   (caller frees). Used by the registry client; resolution itself only
+   ever touches git/codeload. */
+bool gpm_fetch_text_url(const char *url, char **out_text,
+                        char *error_buffer, size_t error_capacity);
+
 /* Attempts to download the detached package signature published next to
    the archive as "<archive-url>.sig" (docs/signing.md: signatures travel
    as repo/host sidecars). On success envelope_out receives a malloc'd
