@@ -35,4 +35,18 @@ bool gpm_fetch_package(const GpmSource *source, const char *commit,
                        char *actual_sha256_out, char *error_buffer,
                        size_t error_capacity);
 
+/* Attempts to download the detached package signature published next to
+   the archive as "<archive-url>.sig" (docs/signing.md: signatures travel
+   as repo/host sidecars). On success envelope_out receives a malloc'd
+   GENESIS-SIG-1 envelope text (caller frees); a missing or unreadable
+   sidecar is not an error — *envelope_out is simply NULL. Returns false
+   only on internal failures such as allocation errors. staging_dir must
+   exist; a temporary download file is removed before returning. */
+bool gpm_fetch_package_signature(const GpmSource *source,
+                                 const char *commit,
+                                 const char *staging_dir,
+                                 char **envelope_out,
+                                 char *error_buffer,
+                                 size_t error_capacity);
+
 #endif

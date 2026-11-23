@@ -4,6 +4,7 @@
 
 #include "manifest.h"
 #include "resolver.h"
+#include "signing.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -217,6 +218,7 @@ static void remove_package_at(GpmLockfile *lockfile, size_t index) {
     free(package->commit);
     free(package->sha256);
     free(package->version);
+    free(package->signature);
     for (size_t dep = 0; dep < package->dependency_count; dep++) {
         free(package->dependencies[dep].alias);
         free(package->dependencies[dep].source);
@@ -375,6 +377,7 @@ static void gpm_locked_package_clear(GpmLockedPackage *package) {
     free(package->commit);
     free(package->sha256);
     free(package->version);
+    free(package->signature);
     for (size_t index = 0; index < package->dependency_count; index++)
         gpm_dependency_free_fields(&package->dependencies[index]);
     free(package->dependencies);
@@ -429,6 +432,7 @@ static bool gpm_manifest_add_dependency(GpmManifest *manifest,
 static bool gpm_lockfile_upsert(GpmLockfile *lockfile, const char *alias,
                                 const char *source, const char *commit,
                                 const char *sha256, const char *version,
+                                const char *signature,
                                 const GpmDependency *dependencies,
                                 size_t dependency_count) {
     GpmLockedPackage *package = gpm_lockfile_find_package(lockfile, alias);
@@ -449,8 +453,10 @@ static bool gpm_lockfile_upsert(GpmLockfile *lockfile, const char *alias,
     package->commit = gpm_strdup(commit);
     package->sha256 = gpm_strdup(sha256);
     package->version = version ? gpm_strdup(version) : NULL;
+    package->signature = signature ? gpm_strdup(signature) : NULL;
     if (!package->alias || !package->source || !package->commit ||
         !package->sha256 || (version && !package->version) ||
+        (signature && !package->signature) ||
         !gpm_dependencies_copy(dependencies, dependency_count,
                                &package->dependencies)) {
         /* Callers abort on failure and free the lockfile; a cleared entry
@@ -503,8 +509,37 @@ static bool pkg_marker_matches(const char *package_dir, const char *commit,
 
 struct ResolveContext {
     GpmLockfile *lockfile;
+    /* Effective package trust for signature verification: the project
+       manifest's trustedPackageKeys/signedPackagesRequired when present,
+       otherwise the lockfile's pinned copy. */
+    const GpmPackageTrust *package_trust;
     char error[PKG_ERROR_SIZE];
 };
+
+/* Picks the trust configuration that actually constrains installs:
+   genesis.json is the project trust root; the lockfile carries a pinned
+   copy for frozen installs. A configured primary wins over fallback. */
+static const GpmPackageTrust *pkg_effective_trust(
+    const GpmPackageTrust *primary, const GpmPackageTrust *fallback) {
+    if (primary && (primary->key_count || primary->signatures_required))
+        return primary;
+    return fallback;
+}
+
+/* Copies the manifest's trust configuration into the lockfile so frozen
+   installs verify against the keys that resolved it. Only overwrites
+   when the manifest actually configures trust. */
+static void pkg_pin_trust_to_lockfile(GpmManifest *manifest,
+                                      GpmLockfile *lockfile) {
+    if (!manifest)
+        return;
+    if (!manifest->package_trust.key_count &&
+        !manifest->package_trust.signatures_required)
+        return;
+    gpm_package_trust_free(&lockfile->package_trust);
+    (void)gpm_package_trust_copy(&manifest->package_trust,
+                                 &lockfile->package_trust);
+}
 
 /* Installs the verified staging tree at packages/<alias>, replacing any
    previous installation only after staging succeeded. */
@@ -572,6 +607,7 @@ static bool gpm_resolve_and_install(const char *alias, const char *source_spec,
        verified installation needs no download at all. */
     char previous_commit[GIT_SHA_TEXT_LENGTH];
     char previous_sha256[SHA256_TEXT_LENGTH];
+    char *previous_signature = NULL;
     bool had_previous =
         existing && existing->commit && existing->sha256 &&
         strlen(existing->commit) == GIT_SHA_TEXT_LENGTH - 1 &&
@@ -581,16 +617,21 @@ static bool gpm_resolve_and_install(const char *alias, const char *source_spec,
                  existing->commit);
         snprintf(previous_sha256, sizeof(previous_sha256), "%s",
                  existing->sha256);
+        if (existing->signature)
+            previous_signature = gpm_strdup(existing->signature);
     }
 
     GpmSource source;
     if (!gpm_source_parse(source_spec, &source, ctx->error,
-                          sizeof(ctx->error)))
+                          sizeof(ctx->error))) {
+        free(previous_signature);
         return false;
+    }
     char commit[GIT_SHA_TEXT_LENGTH];
     if (!gpm_resolve_commit(&source, commit, ctx->error,
                             sizeof(ctx->error))) {
         gpm_source_free(&source);
+        free(previous_signature);
         return false;
     }
     if (had_previous && !strcmp(commit, previous_commit)) {
@@ -598,6 +639,7 @@ static bool gpm_resolve_and_install(const char *alias, const char *source_spec,
         if (pkg_package_dir_path(alias, package_dir, sizeof(package_dir)) &&
             pkg_marker_matches(package_dir, commit, previous_sha256)) {
             gpm_source_free(&source);
+            free(previous_signature);
             return true;
         }
     }
@@ -613,6 +655,7 @@ static bool gpm_resolve_and_install(const char *alias, const char *source_spec,
                  "Could not create staging directory '%.440s'.",
                  staging_dir);
         gpm_source_free(&source);
+        free(previous_signature);
         return false;
     }
     char sha256[SHA256_TEXT_LENGTH];
@@ -627,8 +670,23 @@ static bool gpm_resolve_and_install(const char *alias, const char *source_spec,
                            sha256, ctx->error, sizeof(ctx->error))) {
         pkg_remove_tree(staging_dir);
         gpm_source_free(&source);
+        free(previous_signature);
         return false;
     }
+    /* The detached signature travels as a "<archive-url>.sig" sidecar;
+       a previously pinned lockfile signature is the fallback when the
+       host does not publish one. */
+    char *fetched_signature = NULL;
+    if (!gpm_fetch_package_signature(&source, commit, staging_dir,
+                                     &fetched_signature, ctx->error,
+                                     sizeof(ctx->error))) {
+        pkg_remove_tree(staging_dir);
+        gpm_source_free(&source);
+        free(previous_signature);
+        return false;
+    }
+    const char *signature_text =
+        fetched_signature ? fetched_signature : previous_signature;
     /* Load the fetched manifest for version and dependency flattening. */
     char manifest_path[8192];
     snprintf(manifest_path, sizeof(manifest_path), "%s/%s", staging_dir,
@@ -645,6 +703,41 @@ static bool gpm_resolve_and_install(const char *alias, const char *source_spec,
             gpm_manifest_free(package_manifest);
         pkg_remove_tree(staging_dir);
         gpm_source_free(&source);
+        free(fetched_signature);
+        free(previous_signature);
+        return false;
+    }
+    /* Verify the package signature against the canonical
+       gpm-package-v1 payload before anything is installed. The
+       version-or-commit binding prefers the package's declared version
+       and falls back to the pinned commit. */
+    const char *version_or_commit =
+        package_manifest->version && *package_manifest->version
+            ? package_manifest->version
+            : commit;
+    if (signature_text) {
+        if (!gpm_verify_package_signature(
+                alias, version_or_commit, sha256, signature_text,
+                ctx->package_trust, ctx->error, sizeof(ctx->error))) {
+            if (package_manifest)
+                gpm_manifest_free(package_manifest);
+            pkg_remove_tree(staging_dir);
+            gpm_source_free(&source);
+            free(fetched_signature);
+            free(previous_signature);
+            return false;
+        }
+    } else if (ctx->package_trust &&
+               ctx->package_trust->signatures_required) {
+        snprintf(ctx->error, sizeof(ctx->error),
+                 "Package '%s' requires a detached signature "
+                 "(signedPackagesRequired), but no signature was "
+                 "published with the archive.", alias);
+        gpm_manifest_free(package_manifest);
+        pkg_remove_tree(staging_dir);
+        gpm_source_free(&source);
+        free(fetched_signature);
+        free(previous_signature);
         return false;
     }
     if (!pkg_install_staged(alias, staging_dir, commit, sha256)) {
@@ -654,14 +747,19 @@ static bool gpm_resolve_and_install(const char *alias, const char *source_spec,
         gpm_manifest_free(package_manifest);
         pkg_remove_tree(staging_dir);
         gpm_source_free(&source);
+        free(fetched_signature);
+        free(previous_signature);
         return false;
     }
     bool recorded = gpm_lockfile_upsert(
         ctx->lockfile, alias, source_spec, commit, sha256,
-        package_manifest->version, package_manifest->dependencies,
+        package_manifest->version, signature_text,
+        package_manifest->dependencies,
         package_manifest->dependency_count);
     gpm_manifest_free(package_manifest);
     gpm_source_free(&source);
+    free(fetched_signature);
+    free(previous_signature);
     if (!recorded) {
         snprintf(ctx->error, sizeof(ctx->error), "Out of memory.");
         return false;
@@ -768,6 +866,8 @@ static int command_add(int argument_count, char **argument_values) {
     struct ResolveContext context;
     memset(&context, 0, sizeof(context));
     context.lockfile = lockfile;
+    context.package_trust = pkg_effective_trust(
+        &manifest->package_trust, &lockfile->package_trust);
     if (!gpm_resolve_and_install(alias, source_spec, &context, false, 0)) {
         pkg_error("%s", context.error[0] ? context.error
                                           : "Resolution failed.");
@@ -775,6 +875,7 @@ static int command_add(int argument_count, char **argument_values) {
         gpm_manifest_free(manifest);
         return 1;
     }
+    pkg_pin_trust_to_lockfile(manifest, lockfile);
     if (!gpm_manifest_add_dependency(manifest, alias, source_spec) ||
         !gpm_manifest_save(manifest, GPM_MANIFEST_FILE, error,
                            sizeof(error)) ||
@@ -852,6 +953,8 @@ static int command_install(int argument_count, char **argument_values) {
         struct ResolveContext context;
         memset(&context, 0, sizeof(context));
         context.lockfile = lockfile;
+        context.package_trust = pkg_effective_trust(
+            &manifest->package_trust, &lockfile->package_trust);
         for (size_t index = 0; index < manifest->dependency_count;
              index++) {
             const GpmDependency *dependency =
@@ -868,6 +971,7 @@ static int command_install(int argument_count, char **argument_values) {
                 return 1;
             }
         }
+        pkg_pin_trust_to_lockfile(manifest, lockfile);
         if (!gpm_lockfile_save(lockfile, GPM_LOCKFILE_FILE, error,
                                sizeof(error))) {
             pkg_error("%s", error[0] ? error : "Cannot write lockfile.");
@@ -893,6 +997,35 @@ static int command_install(int argument_count, char **argument_values) {
                                package->sha256)) {
             printf("%s already installed\n", package->alias);
             continue;
+        }
+        /* Verify the pinned archive signature before downloading: the
+           lockfile's sha256 is what the signature binds, so a bad sig
+           fails fast without touching the network. */
+        const GpmPackageTrust *trust = pkg_effective_trust(
+            manifest ? &manifest->package_trust : NULL,
+            &lockfile->package_trust);
+        const char *version_or_commit =
+            package->version && *package->version ? package->version
+                                                  : package->commit;
+        if (package->signature) {
+            if (!gpm_verify_package_signature(
+                    package->alias, version_or_commit, package->sha256,
+                    package->signature, trust, error, sizeof(error))) {
+                pkg_error("%s", error[0] ? error
+                                         : "Signature verification failed.");
+                gpm_lockfile_free(lockfile);
+                if (manifest)
+                    gpm_manifest_free(manifest);
+                return 1;
+            }
+        } else if (trust->signatures_required) {
+            pkg_error("Package '%s' requires a detached signature "
+                      "(signedPackagesRequired), but the lockfile has "
+                      "none for it.", package->alias);
+            gpm_lockfile_free(lockfile);
+            if (manifest)
+                gpm_manifest_free(manifest);
+            return 1;
         }
         GpmSource source;
         if (!gpm_source_parse(package->source, &source, error,
@@ -953,6 +1086,8 @@ static int command_update(const char *alias) {
     struct ResolveContext context;
     memset(&context, 0, sizeof(context));
     context.lockfile = lockfile;
+    context.package_trust = pkg_effective_trust(
+        &manifest->package_trust, &lockfile->package_trust);
     size_t updated = 0;
     for (size_t index = 0; index < manifest->dependency_count; index++) {
         const GpmDependency *dependency = &manifest->dependencies[index];
@@ -975,6 +1110,7 @@ static int command_update(const char *alias) {
         gpm_manifest_free(manifest);
         return 1;
     }
+    pkg_pin_trust_to_lockfile(manifest, lockfile);
     if (!gpm_lockfile_save(lockfile, GPM_LOCKFILE_FILE, error,
                            sizeof(error))) {
         pkg_error("%s", error[0] ? error : "Cannot write lockfile.");
@@ -1108,6 +1244,318 @@ static int command_tree(void) {
     return 0;
 }
 
+/* --- signing commands (docs/signing.md) ---------------------------------- */
+
+static char *pkg_read_file(const char *path, size_t *length_out) {
+    FILE *file = fopen(path, "rb");
+    if (!file)
+        return NULL;
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    long size = ftell(file);
+    if (size < 0 || fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    char *buffer = (char *)malloc((size_t)size + 1);
+    if (!buffer) {
+        fclose(file);
+        return NULL;
+    }
+    size_t got = fread(buffer, 1, (size_t)size, file);
+    fclose(file);
+    if (got != (size_t)size) {
+        free(buffer);
+        return NULL;
+    }
+    buffer[size] = '\0';
+    if (length_out)
+        *length_out = (size_t)size;
+    return buffer;
+}
+
+static int command_keygen(void) {
+    uint8_t public_key[GENESIS_PUBLIC_KEY_BYTES];
+    uint8_t secret_key[GENESIS_SECRET_KEY_BYTES];
+    if (!genesis_signature_keypair(public_key, secret_key)) {
+        pkg_error("Could not generate a keypair: no entropy source is "
+                  "available on this platform.");
+        return 1;
+    }
+    char *directory = gpm_keys_dir();
+    if (!directory) {
+        pkg_error("Out of memory.");
+        return 1;
+    }
+    if (!gpm_key_file_write(directory, public_key, secret_key)) {
+        pkg_error("Could not write the private key under '%s'.",
+                  directory);
+        free(directory);
+        return 1;
+    }
+    uint8_t key_id[GENESIS_KEY_ID_BYTES];
+    genesis_signature_key_id(public_key, key_id);
+    char key_id_text[GENESIS_KEY_ID_BYTES * 2 + 1];
+    char public_key_text[GENESIS_PUBLIC_KEY_BYTES * 2 + 1];
+    genesis_signature_base64url_encode(key_id, GENESIS_KEY_ID_BYTES,
+                                     key_id_text, sizeof(key_id_text));
+    genesis_signature_base64url_encode(public_key,
+                                     GENESIS_PUBLIC_KEY_BYTES,
+                                     public_key_text,
+                                     sizeof(public_key_text));
+    printf("Generated Ed25519 package signing key.\n");
+    printf("  keyId:      %s\n", key_id_text);
+    printf("  publicKey:  %s\n", public_key_text);
+    printf("  privateKey: %s/%s.key\n", directory, key_id_text);
+    printf("Pin the keyId/publicKey pair in genesis.json "
+           "trustedPackageKeys.\n");
+    free(directory);
+    return 0;
+}
+
+/* Shared flag parsing for sign/verify: --key/--pubkey/--alias/--version/
+   --commit plus positional archive and optional signature paths. */
+struct SigningArgs {
+    const char *key_path;
+    const char *public_key_text;
+    const char *alias;
+    const char *version;
+    const char *commit;
+    const char *archive;
+    const char *signature_path;
+};
+
+static bool signing_args_parse(int argument_count, char **argument_values,
+                               struct SigningArgs *args, bool allow_sig_path) {
+    memset(args, 0, sizeof(*args));
+    for (int index = 2; index < argument_count; index++) {
+        const char *arg = argument_values[index];
+        const char **slot = NULL;
+        if (!strcmp(arg, "--key") && index + 1 < argument_count)
+            slot = &args->key_path;
+        else if (!strcmp(arg, "--pubkey") && index + 1 < argument_count)
+            slot = &args->public_key_text;
+        else if (!strcmp(arg, "--alias") && index + 1 < argument_count)
+            slot = &args->alias;
+        else if (!strcmp(arg, "--version") && index + 1 < argument_count)
+            slot = &args->version;
+        else if (!strcmp(arg, "--commit") && index + 1 < argument_count)
+            slot = &args->commit;
+        else if (arg[0] != '-' && !args->archive)
+            args->archive = arg;
+        else if (allow_sig_path && arg[0] != '-' && args->archive &&
+                 !args->signature_path)
+            args->signature_path = arg;
+        else {
+            pkg_error("Unknown argument '%s'.", arg);
+            return false;
+        }
+        if (slot) {
+            if (*slot) {
+                pkg_error("Duplicate argument '%s'.", arg);
+                return false;
+            }
+            *slot = argument_values[++index];
+        }
+    }
+    return true;
+}
+
+static bool signing_args_validate(const struct SigningArgs *args,
+                                  const char *command) {
+    if (!args->archive || !args->alias ||
+        (!args->version && !args->commit) ||
+        (args->version && args->commit)) {
+        pkg_error("Usage: gpm %s --key <keyfile> --alias <alias> "
+                  "(--version <v> | --commit <sha>) <archive-file> "
+                  "[signature.sig]",
+                  command);
+        return false;
+    }
+    if (!gpm_alias_valid(args->alias)) {
+        pkg_error("Invalid package alias '%s'.", args->alias);
+        return false;
+    }
+    if (args->version && !gpm_version_valid(args->version)) {
+        pkg_error("Invalid version '%s' (expected major.minor.patch).",
+                  args->version);
+        return false;
+    }
+    if (args->commit && !gpm_commit_valid(args->commit)) {
+        pkg_error("Invalid commit '%s' (expected 40 hex characters).",
+                  args->commit);
+        return false;
+    }
+    return true;
+}
+
+static const char *signing_version_or_commit(const struct SigningArgs *args) {
+    return args->version ? args->version : args->commit;
+}
+
+static int command_sign(int argument_count, char **argument_values) {
+    struct SigningArgs args;
+    if (!signing_args_parse(argument_count, argument_values, &args,
+                            false) ||
+        !args.key_path ||
+        !signing_args_validate(&args, "sign"))
+        return 1;
+    uint8_t secret_key[GENESIS_SECRET_KEY_BYTES];
+    if (!gpm_key_file_load(args.key_path, secret_key)) {
+        pkg_error("Cannot read secret key '%s'.", args.key_path);
+        return 1;
+    }
+    char sha256[SHA256_TEXT_LENGTH];
+    if (!gpm_sha256_file_hex(args.archive, sha256)) {
+        pkg_error("Cannot hash archive '%s'.", args.archive);
+        return 1;
+    }
+    char *payload = gpm_package_payload(
+        args.alias, signing_version_or_commit(&args), sha256);
+    if (!payload) {
+        pkg_error("Out of memory.");
+        return 1;
+    }
+    /* TweetNaCl secret keys are seed || public key; the public half is
+       the trailing 32 bytes. */
+    const uint8_t *public_key = secret_key + 32;
+    uint8_t key_id[GENESIS_KEY_ID_BYTES];
+    uint8_t signature[GENESIS_SIGNATURE_BYTES];
+    genesis_signature_key_id(public_key, key_id);
+    genesis_signature_sign((const uint8_t *)payload, strlen(payload),
+                           secret_key, signature);
+    free(payload);
+    char *envelope = genesis_signature_envelope_format(key_id, signature);
+    if (!envelope) {
+        pkg_error("Out of memory.");
+        return 1;
+    }
+    size_t sig_path_length = strlen(args.archive) + 5;
+    char *sig_path = (char *)malloc(sig_path_length);
+    if (!sig_path) {
+        pkg_error("Out of memory.");
+        free(envelope);
+        return 1;
+    }
+    snprintf(sig_path, sig_path_length, "%s.sig", args.archive);
+    FILE *file = fopen(sig_path, "wb");
+    bool ok = file != NULL;
+    if (ok) {
+        ok = fputs(envelope, file) >= 0;
+        if (fclose(file) != 0)
+            ok = false;
+    }
+    free(envelope);
+    if (!ok) {
+        pkg_error("Cannot write signature '%s'.", sig_path);
+        free(sig_path);
+        return 1;
+    }
+    printf("Wrote %s\n", sig_path);
+    free(sig_path);
+    return 0;
+}
+
+static int command_verify(int argument_count, char **argument_values) {
+    struct SigningArgs args;
+    if (!signing_args_parse(argument_count, argument_values, &args,
+                            true) ||
+        !signing_args_validate(&args, "verify"))
+        return 1;
+    if ((args.key_path != NULL) == (args.public_key_text != NULL)) {
+        pkg_error("gpm verify needs exactly one of --key <keyfile> or "
+                  "--pubkey <base64url>.");
+        return 1;
+    }
+    uint8_t public_key[GENESIS_PUBLIC_KEY_BYTES];
+    if (args.key_path) {
+        uint8_t secret_key[GENESIS_SECRET_KEY_BYTES];
+        if (!gpm_key_file_load(args.key_path, secret_key)) {
+            pkg_error("Cannot read secret key '%s'.", args.key_path);
+            return 1;
+        }
+        memcpy(public_key, secret_key + 32, GENESIS_PUBLIC_KEY_BYTES);
+    } else {
+        size_t decoded = 0;
+        if (!genesis_signature_base64url_decode(
+                args.public_key_text, strlen(args.public_key_text),
+                public_key, GENESIS_PUBLIC_KEY_BYTES, &decoded) ||
+            decoded != GENESIS_PUBLIC_KEY_BYTES) {
+            pkg_error("'--pubkey' is not a valid base64url 32-byte "
+                      "public key.");
+            return 1;
+        }
+    }
+    char *sig_path_storage = NULL;
+    const char *sig_path = args.signature_path;
+    if (!sig_path) {
+        size_t length = strlen(args.archive) + 5;
+        sig_path_storage = (char *)malloc(length);
+        if (!sig_path_storage) {
+            pkg_error("Out of memory.");
+            return 1;
+        }
+        snprintf(sig_path_storage, length, "%s.sig", args.archive);
+        sig_path = sig_path_storage;
+    }
+    size_t envelope_length = 0;
+    char *envelope = pkg_read_file(sig_path, &envelope_length);
+    if (!envelope) {
+        pkg_error("Cannot read signature '%s'.", sig_path);
+        free(sig_path_storage);
+        return 1;
+    }
+    uint8_t envelope_key_id[GENESIS_KEY_ID_BYTES];
+    uint8_t envelope_signature[GENESIS_SIGNATURE_BYTES];
+    bool ok = genesis_signature_envelope_parse(
+        envelope, envelope_length, envelope_key_id, envelope_signature);
+    free(envelope);
+    if (!ok) {
+        pkg_error("'%s' is not a valid GENESIS-SIG-1 envelope.", sig_path);
+        free(sig_path_storage);
+        return 1;
+    }
+    uint8_t expected_key_id[GENESIS_KEY_ID_BYTES];
+    genesis_signature_key_id(public_key, expected_key_id);
+    if (memcmp(expected_key_id, envelope_key_id, GENESIS_KEY_ID_BYTES)) {
+        pkg_error("Signature keyId does not match the supplied public "
+                  "key.");
+        free(sig_path_storage);
+        return 1;
+    }
+    char sha256[SHA256_TEXT_LENGTH];
+    if (!gpm_sha256_file_hex(args.archive, sha256)) {
+        pkg_error("Cannot hash archive '%s'.", args.archive);
+        free(sig_path_storage);
+        return 1;
+    }
+    char *payload = gpm_package_payload(
+        args.alias, signing_version_or_commit(&args), sha256);
+    if (!payload) {
+        pkg_error("Out of memory.");
+        free(sig_path_storage);
+        return 1;
+    }
+    ok = genesis_signature_verify((const uint8_t *)payload,
+                                  strlen(payload), envelope_signature,
+                                  public_key);
+    free(payload);
+    free(sig_path_storage);
+    if (!ok) {
+        pkg_error("Signature verification failed for '%s'.",
+                  args.alias);
+        return 1;
+    }
+    char key_id_text[GENESIS_KEY_ID_BYTES * 2 + 1];
+    genesis_signature_base64url_encode(expected_key_id,
+                                     GENESIS_KEY_ID_BYTES, key_id_text,
+                                     sizeof(key_id_text));
+    printf("Verified %s signature (keyId %s)\n", args.alias, key_id_text);
+    return 0;
+}
+
 static void usage(void) {
     fprintf(stderr,
             "Usage: gpm <command>\n"
@@ -1126,8 +1574,17 @@ static void usage(void) {
             "installed package.\n"
             "  tree                     Print the dependency tree from "
             "genesis.json/genesis.lock.json.\n"
+            "  keygen                   Generate an Ed25519 package "
+            "signing key under "
+            "~/.config/genesis/keys.\n"
+            "  sign --key K --alias a (--version v|--commit c) <archive>\n"
+            "                          Sign a package archive, writing "
+            "<archive>.sig.\n"
+            "  verify --key K|--pubkey P --alias a (--version v|--commit c)\n"
+            "          <archive> [sig] Verify a package signature.\n"
             "\n"
-            "See docs/package-manager.md for the package format.\n");
+            "See docs/package-manager.md for the package format and "
+            "docs/signing.md for package signing.\n");
 }
 
 int main(int argument_count, char **argument_values) {
@@ -1151,6 +1608,12 @@ int main(int argument_count, char **argument_values) {
     if (!strcmp(command, "update") && argument_count <= 3)
         return command_update(argument_count == 3 ? argument_values[2]
                                                   : NULL);
+    if (!strcmp(command, "keygen") && argument_count == 2)
+        return command_keygen();
+    if (!strcmp(command, "sign") && argument_count >= 3)
+        return command_sign(argument_count, argument_values);
+    if (!strcmp(command, "verify") && argument_count >= 3)
+        return command_verify(argument_count, argument_values);
     usage();
     return 1;
 }

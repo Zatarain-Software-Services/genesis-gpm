@@ -1,9 +1,12 @@
 #ifndef GPM_MANIFEST_H
 #define GPM_MANIFEST_H
 
+#include "signature.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdint.h>
 
 /* A manifest dependency alias maps to a source specifier such as
    "github:owner/repo@v1.0.0". */
@@ -11,6 +14,23 @@ typedef struct {
     char *alias;
     char *source;
 } GpmDependency;
+
+/* A trusted package signing key: key_id is the 16-byte SHA-512(public
+   key) fingerprint and public_key the raw 32-byte Ed25519 key, matching
+   the GENESIS-SIG-1 envelope and docs/signing.md. */
+typedef struct {
+    uint8_t key_id[GENESIS_KEY_ID_BYTES];
+    uint8_t public_key[GENESIS_PUBLIC_KEY_BYTES];
+} GpmTrustedKey;
+
+/* Package signature trust configuration shared by genesis.json and
+   genesis.lock.json: a keyId -> public-key map plus the opt-in
+   requirement flag. */
+typedef struct {
+    GpmTrustedKey *keys;
+    size_t key_count;
+    bool signatures_required;
+} GpmPackageTrust;
 
 typedef struct {
     char *name;
@@ -25,6 +45,10 @@ typedef struct {
        to the checker. */
     char **native_extensions;
     size_t native_extension_count;
+    /* Optional package signing trust: trustedPackageKeys maps a keyId to
+       a base64url public key; signedPackagesRequired makes a missing or
+       invalid package signature a hard error. Both default to absent. */
+    GpmPackageTrust package_trust;
 } GpmManifest;
 
 typedef struct {
@@ -33,6 +57,10 @@ typedef struct {
     char *commit;
     char *sha256;
     char *version;
+    /* Detached GENESIS-SIG-1 envelope text for this package's archive,
+       when one was supplied by the package host or pinned by hand.
+       Signs the gpm-package-v1 canonical payload. */
+    char *signature;
     GpmDependency *dependencies;
     size_t dependency_count;
 } GpmLockedPackage;
@@ -41,6 +69,10 @@ typedef struct {
     int version;
     GpmLockedPackage *packages;
     size_t package_count;
+    /* Pinned copy of the project's package trust configuration, written
+       by gpm add/update so `gpm install` verifies against the same keys
+       that resolved the lockfile. */
+    GpmPackageTrust package_trust;
 } GpmLockfile;
 
 #define GPM_MANIFEST_FILE "genesis.json"
@@ -80,5 +112,9 @@ bool gpm_lockfile_save(const GpmLockfile *lockfile,
                                size_t error_capacity);
 GpmLockedPackage *gpm_lockfile_find_package(
     GpmLockfile *lockfile, const char *alias);
+
+void gpm_package_trust_free(GpmPackageTrust *trust);
+bool gpm_package_trust_copy(const GpmPackageTrust *source,
+                            GpmPackageTrust *out);
 
 #endif

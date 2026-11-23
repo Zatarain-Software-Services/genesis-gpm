@@ -447,6 +447,84 @@ bool gpm_fetch_package(const GpmSource *source, const char *commit,
     return valid;
 }
 
+static char *resolver_read_text_file(const char *path, size_t *length_out) {
+    FILE *file = fopen(path, "rb");
+    if (!file)
+        return NULL;
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    long size = ftell(file);
+    if (size < 0 || fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    char *text = (char *)malloc((size_t)size + 1);
+    if (!text) {
+        fclose(file);
+        return NULL;
+    }
+    size_t got = fread(text, 1, (size_t)size, file);
+    fclose(file);
+    if (got != (size_t)size) {
+        free(text);
+        return NULL;
+    }
+    text[size] = '\0';
+    if (length_out)
+        *length_out = (size_t)size;
+    return text;
+}
+
+bool gpm_fetch_package_signature(const GpmSource *source,
+                                 const char *commit,
+                                 const char *staging_dir,
+                                 char **envelope_out,
+                                 char *error_buffer,
+                                 size_t error_capacity) {
+    *envelope_out = NULL;
+    if (!source || !commit || !staging_dir ||
+        !resolver_is_hex(commit, GIT_SHA_LENGTH)) {
+        resolver_error(error_buffer, error_capacity, "Invalid arguments.");
+        return false;
+    }
+    char sig_path[4096];
+    int written = snprintf(sig_path, sizeof(sig_path),
+                           "%s/.gpm-package.sig", staging_dir);
+    if (written < 0 || (size_t)written >= sizeof(sig_path)) {
+        resolver_error(error_buffer, error_capacity, "Path too long.");
+        return false;
+    }
+    char url[1200];
+    written = snprintf(url, sizeof(url), "%s/%s/%s/tar.gz/%s.sig",
+                       resolver_archive_base(), source->owner,
+                       source->repo, commit);
+    if (written < 0 || (size_t)written >= sizeof(url)) {
+        resolver_error(error_buffer, error_capacity,
+                       "Signature URL is too long.");
+        return false;
+    }
+    char *download_argv[] = {"curl", "-fsSL", "-o", sig_path, url, NULL};
+    /* curl exits non-zero for a missing sidecar; that simply means the
+       package is unsigned, so any failure leaves envelope_out NULL. */
+    resolver_run_capture(download_argv, NULL, 0, NULL, 0);
+    if (!resolver_file_exists(sig_path)) {
+        unlink(sig_path);
+        return true;
+    }
+    size_t length = 0;
+    char *envelope = resolver_read_text_file(sig_path, &length);
+    unlink(sig_path);
+    if (!envelope) {
+        resolver_error(error_buffer, error_capacity,
+                       "Could not read the package signature sidecar.");
+        return false;
+    }
+    *envelope_out = envelope;
+    return true;
+}
+
 #else /* _WIN32: resolver needs git/curl/tar/sha256sum, all POSIX tools. */
 
 static void resolver_unsupported(char *error_buffer, size_t error_capacity) {
@@ -491,6 +569,21 @@ bool gpm_fetch_package(const GpmSource *source, const char *commit,
     (void)actual_sha256_out;
     resolver_unsupported(error_buffer, error_capacity);
     return false;
+}
+
+bool gpm_fetch_package_signature(const GpmSource *source,
+                                 const char *commit,
+                                 const char *staging_dir,
+                                 char **envelope_out,
+                                 char *error_buffer,
+                                 size_t error_capacity) {
+    (void)source;
+    (void)commit;
+    (void)staging_dir;
+    (void)error_buffer;
+    (void)error_capacity;
+    *envelope_out = NULL;
+    return true;
 }
 
 #endif /* !_WIN32 */

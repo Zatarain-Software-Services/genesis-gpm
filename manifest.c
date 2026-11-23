@@ -242,6 +242,157 @@ static void manifest_free_dependencies(GpmDependency *dependencies,
     free(dependencies);
 }
 
+void gpm_package_trust_free(GpmPackageTrust *trust) {
+    if (!trust)
+        return;
+    free(trust->keys);
+    trust->keys = NULL;
+    trust->key_count = 0;
+    trust->signatures_required = false;
+}
+
+bool gpm_package_trust_copy(const GpmPackageTrust *source,
+                            GpmPackageTrust *out) {
+    memset(out, 0, sizeof(*out));
+    if (!source)
+        return true;
+    out->signatures_required = source->signatures_required;
+    if (!source->key_count)
+        return true;
+    out->keys = (GpmTrustedKey *)calloc(source->key_count,
+                                      sizeof(*out->keys));
+    if (!out->keys)
+        return false;
+    memcpy(out->keys, source->keys,
+           source->key_count * sizeof(*out->keys));
+    out->key_count = source->key_count;
+    return true;
+}
+
+/* Parses "trustedPackageKeys" (keyId -> base64url public key) and
+   "signedPackagesRequired" from a genesis.json or genesis.lock.json
+   object. Mirrors the trustedExtensionKeys rules in
+   src/native_extensions.c: every keyId must be the SHA-512 fingerprint
+   of its public key. */
+static bool manifest_parse_package_trust(
+    JsonValue *root, GpmPackageTrust *trust, char *error_buffer,
+    size_t error_capacity, const char *file_label) {
+    memset(trust, 0, sizeof(*trust));
+    const JsonValue *keys_member =
+        json_object_member(root, "trustedPackageKeys");
+    if (keys_member) {
+        if (keys_member->type != JSON_VALUE_OBJECT) {
+            manifest_set_error(error_buffer, error_capacity,
+                               "'trustedPackageKeys' in %s must be an "
+                               "object mapping keyId to a base64url public "
+                               "key.", file_label);
+            return false;
+        }
+        trust->keys = (GpmTrustedKey *)calloc(
+            keys_member->member_count ? keys_member->member_count : 1,
+            sizeof(*trust->keys));
+        if (!trust->keys && keys_member->member_count) {
+            manifest_set_error(error_buffer, error_capacity,
+                               "Out of memory reading trustedPackageKeys.");
+            return false;
+        }
+        for (size_t index = 0; index < keys_member->member_count; index++) {
+            const JsonMember *entry = &keys_member->members[index];
+            const JsonValue *public_key_value = entry->value;
+            GpmTrustedKey *key = &trust->keys[index];
+            if (public_key_value->type != JSON_VALUE_STRING) {
+                manifest_set_error(error_buffer, error_capacity,
+                                   "'trustedPackageKeys' entry in %s must "
+                                   "map a keyId to a base64url public key "
+                                   "string.", file_label);
+                gpm_package_trust_free(trust);
+                return false;
+            }
+            size_t decoded_key_id = 0;
+            size_t decoded_public_key = 0;
+            if (!genesis_signature_base64url_decode(
+                    entry->key, strlen(entry->key), key->key_id,
+                    GENESIS_KEY_ID_BYTES, &decoded_key_id) ||
+                decoded_key_id != GENESIS_KEY_ID_BYTES ||
+                !genesis_signature_base64url_decode(
+                    public_key_value->string,
+                    strlen(public_key_value->string), key->public_key,
+                    GENESIS_PUBLIC_KEY_BYTES, &decoded_public_key) ||
+                decoded_public_key != GENESIS_PUBLIC_KEY_BYTES) {
+                manifest_set_error(error_buffer, error_capacity,
+                                   "'trustedPackageKeys' entry in %s is "
+                                   "not valid base64url key material.",
+                                   file_label);
+                gpm_package_trust_free(trust);
+                return false;
+            }
+            uint8_t derived_key_id[GENESIS_KEY_ID_BYTES];
+            genesis_signature_key_id(key->public_key, derived_key_id);
+            if (memcmp(derived_key_id, key->key_id,
+                       GENESIS_KEY_ID_BYTES) != 0) {
+                manifest_set_error(error_buffer, error_capacity,
+                                   "'trustedPackageKeys' keyId does not "
+                                   "match its public key in %s.",
+                                   file_label);
+                gpm_package_trust_free(trust);
+                return false;
+            }
+            trust->key_count++;
+        }
+    }
+    const JsonValue *required_member =
+        json_object_member(root, "signedPackagesRequired");
+    trust->signatures_required =
+        required_member && required_member->type == JSON_VALUE_TRUE;
+    return true;
+}
+
+static JsonValue *json_build_trusted_keys(const GpmPackageTrust *trust) {
+    JsonValue *object = json_value_new(JSON_VALUE_OBJECT);
+    if (!object)
+        return NULL;
+    for (size_t index = 0; index < trust->key_count; index++) {
+        const GpmTrustedKey *key = &trust->keys[index];
+        char key_id_text[GENESIS_KEY_ID_BYTES * 2];
+        char public_key_text[GENESIS_PUBLIC_KEY_BYTES * 2];
+        if (!genesis_signature_base64url_encode(
+                key->key_id, GENESIS_KEY_ID_BYTES, key_id_text,
+                sizeof(key_id_text)) ||
+            !genesis_signature_base64url_encode(
+                key->public_key, GENESIS_PUBLIC_KEY_BYTES,
+                public_key_text, sizeof(public_key_text)) ||
+            !json_object_add(object, key_id_text,
+                             json_string_new(public_key_text))) {
+            json_value_free(object);
+            return NULL;
+        }
+    }
+    return object;
+}
+
+static bool manifest_write_trust_fields(JsonValue *root,
+                                        const GpmPackageTrust *trust,
+                                        char *error_buffer,
+                                        size_t error_capacity) {
+    if (trust->key_count) {
+        JsonValue *keys = json_build_trusted_keys(trust);
+        if (!keys || !json_object_add(root, "trustedPackageKeys", keys)) {
+            json_value_free(keys);
+            manifest_set_error(error_buffer, error_capacity,
+                               "Out of memory writing trustedPackageKeys.");
+            return false;
+        }
+    }
+    if (trust->signatures_required &&
+        !json_object_add(root, "signedPackagesRequired",
+                         json_value_new(JSON_VALUE_TRUE))) {
+        manifest_set_error(error_buffer, error_capacity,
+                           "Out of memory writing signedPackagesRequired.");
+        return false;
+    }
+    return true;
+}
+
 static void manifest_free_native_extensions(char **extensions,
                                             size_t count);
 
@@ -313,6 +464,7 @@ void gpm_manifest_free(GpmManifest *manifest) {
                              manifest->dependency_count);
     manifest_free_native_extensions(manifest->native_extensions,
                                     manifest->native_extension_count);
+    gpm_package_trust_free(&manifest->package_trust);
     free(manifest);
 }
 
@@ -377,7 +529,10 @@ GpmManifest *gpm_manifest_load(const char *path,
                   error_buffer, error_capacity) &&
               manifest_parse_native_extensions(root, &manifest->native_extensions,
                                                &manifest->native_extension_count,
-                                               error_buffer, error_capacity);
+                                               error_buffer, error_capacity) &&
+              manifest_parse_package_trust(root, &manifest->package_trust,
+                                           error_buffer, error_capacity,
+                                           GPM_MANIFEST_FILE);
     json_value_free(root);
     if (!ok) {
         gpm_manifest_free(manifest);
@@ -460,6 +615,9 @@ bool gpm_manifest_save(const GpmManifest *manifest,
             ok = false;
         }
     }
+    if (ok)
+        ok = manifest_write_trust_fields(root, &manifest->package_trust,
+                                         error_buffer, error_capacity);
     if (ok)
         ok = json_write_file(root, path, error_buffer, error_capacity);
     if (!ok && error_buffer && error_capacity && !error_buffer[0])
@@ -545,6 +703,7 @@ static void lockfile_free_package(GpmLockedPackage *package) {
     free(package->commit);
     free(package->sha256);
     free(package->version);
+    free(package->signature);
     manifest_free_dependencies(package->dependencies,
                              package->dependency_count);
 }
@@ -555,6 +714,7 @@ void gpm_lockfile_free(GpmLockfile *lockfile) {
     for (size_t index = 0; index < lockfile->package_count; index++)
         lockfile_free_package(&lockfile->packages[index]);
     free(lockfile->packages);
+    gpm_package_trust_free(&lockfile->package_trust);
     free(lockfile);
 }
 
@@ -595,7 +755,9 @@ GpmLockfile *gpm_lockfile_load(const char *path,
     if (version_member && version_member->type == JSON_VALUE_NUMBER)
         lockfile->version = atoi(version_member->string);
     const JsonValue *packages_member = json_object_member(root, "packages");
-    bool ok = true;
+    bool ok = manifest_parse_package_trust(root, &lockfile->package_trust,
+                                           error_buffer, error_capacity,
+                                           GPM_LOCKFILE_FILE);
     if (packages_member) {
         if (packages_member->type != JSON_VALUE_OBJECT) {
             manifest_set_error(error_buffer, error_capacity,
@@ -634,6 +796,9 @@ GpmLockfile *gpm_lockfile_load(const char *path,
                                                 error_buffer, error_capacity) &&
                          manifest_member_string(entry, "version",
                                                 &package->version, false,
+                                                error_buffer, error_capacity) &&
+                         manifest_member_string(entry, "signature",
+                                                &package->signature, false,
                                                 error_buffer, error_capacity) &&
                          lockfile_parse_dependencies(
                              json_dependencies_object(entry, "dependencies"),
@@ -682,6 +847,9 @@ static JsonValue *json_build_locked_package(
     if (ok && package->version)
         ok = json_object_add(entry, "version",
                              json_string_new(package->version));
+    if (ok && package->signature)
+        ok = json_object_add(entry, "signature",
+                             json_string_new(package->signature));
     if (ok && package->dependency_count) {
         JsonValue *dependencies = json_build_dependencies(
             package->dependencies, package->dependency_count);
@@ -731,6 +899,9 @@ bool gpm_lockfile_save(const GpmLockfile *lockfile,
         json_value_free(packages);
         ok = false;
     }
+    if (ok)
+        ok = manifest_write_trust_fields(root, &lockfile->package_trust,
+                                         error_buffer, error_capacity);
     if (ok)
         ok = json_write_file(root, path, error_buffer, error_capacity);
     json_value_free(root);
