@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "packages": {
+    "util": {
+      "source": "github:example-org/genesis-utils@v1.0.0",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "version": "1.0.0",
+      "dependencies": {
+        "json": "github:example/json-tools@v2.1.0"
+      }
+    },
+    "json": {
+      "source": "github:example/json-tools@v2.1.0",
+      "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "version": "2.1.0"
+    },
+    "web": {
+      "source": "github:example-org/web-kit@v2.0.0",
+      "commit": "cccccccccccccccccccccccccccccccccccccccc",
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "version": "2.0.0",
+      "dependencies": {
+        "json": "github:example/json-tools@v2.1.0",
+        "util": "github:example-org/genesis-utils@v1.0.0"
+      }
+    },
+    "orphan": {
+      "source": "github:example-org/orphan@v0.1.0",
+      "commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "version": "0.1.0"
+    }
+  }
+}

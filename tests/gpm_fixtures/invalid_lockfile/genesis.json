@@ -1,0 +1,8 @@
+{
+  "name": "@example-org/fixture-project",
+  "version": "1.2.3",
+  "entry": "index.genesis",
+  "dependencies": {
+    "util": "github:example-org/genesis-utils@v1.0.0"
+  }
+}

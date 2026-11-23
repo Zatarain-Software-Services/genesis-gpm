@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "packages": {
+    "widgets": {
+      "source": "github:acme/widgets",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "version": "1.0.0",
+      "signature": "GENESIS-SIG-1\nkeyId: kDAuL4FXgXkQ8d-9mUeKlw\nalg: ed25519\nsig: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    }
+  },
+  "trustedPackageKeys": {
+    "kDAuL4FXgXkQ8d-9mUeKlw": "MeFH0AuaxqG5Gy3WChmU7ZijAmOuKH7tVdnboDy9BNc"
+  },
+  "signedPackagesRequired": true
+}

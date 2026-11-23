@@ -1,0 +1,9 @@
+{
+  "name": "my-app",
+  "version": "0.1.0",
+  "dependencies": {
+    "util": "github:example-org/genesis-utils@v1.0.0",
+    "web": "github:example-org/web-kit@v2.0.0",
+    "missing-pkg": "github:example-org/not-installed@v1.0.0"
+  }
+}

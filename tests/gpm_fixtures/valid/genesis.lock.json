@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "packages": {
+    "util": {
+      "source": "github:example-org/genesis-utils@v1.0.0",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "version": "1.0.0"
+    }
+  }
+}

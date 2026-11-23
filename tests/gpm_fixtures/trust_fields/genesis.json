@@ -1,0 +1,9 @@
+{
+  "name": "@my-org/my-project",
+  "version": "0.1.0",
+  "entry": "index.genesis",
+  "trustedPackageKeys": {
+    "kDAuL4FXgXkQ8d-9mUeKlw": "MeFH0AuaxqG5Gy3WChmU7ZijAmOuKH7tVdnboDy9BNc"
+  },
+  "signedPackagesRequired": true
+}

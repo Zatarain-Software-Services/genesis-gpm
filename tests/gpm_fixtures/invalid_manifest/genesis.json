@@ -1,0 +1,7 @@
+{
+  "name": "@bad/project",
+  "version": "1.0.0",
+  "dependencies": {
+    "Util": "npm:some-package"
+  }
+}

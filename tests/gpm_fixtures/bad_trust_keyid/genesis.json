@@ -1,0 +1,7 @@
+{
+  "name": "@my-org/my-project",
+  "version": "0.1.0",
+  "trustedPackageKeys": {
+    "AAAAAAAAAAAAAAAAAAAAAA": "MeFH0AuaxqG5Gy3WChmU7ZijAmOuKH7tVdnboDy9BNc"
+  }
+}
