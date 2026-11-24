@@ -7,6 +7,7 @@
 #include "json.h"
 #include "manifest.h"
 #include "resolver.h"
+#include "signature.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -124,8 +125,67 @@ static void registry_list_versions(const JsonValue *document,
     }
 }
 
+static const GpmTrustedKey *registry_trusted_key_find(
+    const GpmPackageTrust *trust, const uint8_t key_id[GENESIS_KEY_ID_BYTES]) {
+    for (size_t index = 0; index < trust->key_count; index++)
+        if (!memcmp(trust->keys[index].key_id, key_id,
+                    GENESIS_KEY_ID_BYTES))
+            return &trust->keys[index];
+    return NULL;
+}
+
+bool gpm_registry_verify_document(const char *base_url, const char *path,
+                                  const char *doc_text,
+                                  const GpmPackageTrust *trust,
+                                  char *error_buffer,
+                                  size_t error_capacity) {
+    if (!trust || !trust->key_count || !doc_text)
+        return true;
+    char sig_path[600];
+    int written = snprintf(sig_path, sizeof(sig_path), "%s.sig", path);
+    if (written < 0 || (size_t)written >= sizeof(sig_path)) {
+        registry_error(error_buffer, error_capacity,
+                       "Registry signature path is too long.");
+        return false;
+    }
+    char *sig_text = NULL;
+    char fetch_error[256];
+    fetch_error[0] = '\0';
+    /* A missing or unfetchable sidecar means the document is unsigned;
+       metadata is advisory so that is not an error (same treatment as
+       package archive sidecars in resolver.c). */
+    if (!gpm_registry_fetch_document(base_url, sig_path, &sig_text,
+                                     fetch_error, sizeof(fetch_error)))
+        return true;
+    uint8_t envelope_key_id[GENESIS_KEY_ID_BYTES];
+    uint8_t envelope_signature[GENESIS_SIGNATURE_BYTES];
+    bool ok = genesis_signature_envelope_parse(
+        sig_text, strlen(sig_text), envelope_key_id, envelope_signature);
+    free(sig_text);
+    if (!ok) {
+        registry_error(error_buffer, error_capacity,
+                       "Registry signature '%s.sig' is not a valid "
+                       "GENESIS-SIG-1 envelope.", path);
+        return false;
+    }
+    const GpmTrustedKey *key = registry_trusted_key_find(trust, envelope_key_id);
+    if (!key)
+        return true;
+    ok = genesis_signature_verify((const uint8_t *)doc_text,
+                                  strlen(doc_text), envelope_signature,
+                                  key->public_key);
+    if (!ok) {
+        registry_error(error_buffer, error_capacity,
+                       "Registry document '%s' signature verification "
+                       "failed.", path);
+        return false;
+    }
+    return true;
+}
+
 bool gpm_registry_resolve(const char *base_url, const char *alias,
-                          const char *version, char **source_out,
+                          const char *version,
+                          const GpmPackageTrust *trust, char **source_out,
                           char **signature_out, char *error_buffer,
                           size_t error_capacity) {
     *source_out = NULL;
@@ -150,6 +210,11 @@ bool gpm_registry_resolve(const char *base_url, const char *alias,
         if (!error_buffer[0])
             registry_error(error_buffer, error_capacity,
                            "Registry has no package '%s'.", alias);
+        return false;
+    }
+    if (!gpm_registry_verify_document(base_url, path, text, trust,
+                                      error_buffer, error_capacity)) {
+        free(text);
         return false;
     }
     char json_error[JSON_ERROR_SIZE];

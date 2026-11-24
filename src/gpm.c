@@ -861,6 +861,7 @@ static int command_add(int argument_count, char **argument_values) {
             return 1;
         }
         if (!gpm_registry_resolve(registry_base, requested, version,
+                                  &manifest->package_trust,
                                   &resolved_source, &resolved_signature,
                                   error, sizeof(error))) {
             pkg_error("%s", error[0] ? error : "Registry resolution failed.");
@@ -1008,12 +1009,18 @@ static const char *pkg_json_string(const JsonValue *object,
 }
 
 static bool pkg_json_fetch(const char *base, const char *path,
+                           const GpmPackageTrust *trust,
                            JsonValue **document_out, char *error,
                            size_t error_capacity) {
     char *text = NULL;
     if (!gpm_registry_fetch_document(base, path, &text, error,
                                      error_capacity))
         return false;
+    if (!gpm_registry_verify_document(base, path, text, trust, error,
+                                      error_capacity)) {
+        free(text);
+        return false;
+    }
     char json_error[JSON_ERROR_SIZE];
     JsonValue *document = json_parse(text, json_error, sizeof(json_error));
     free(text);
@@ -1061,7 +1068,9 @@ static int command_info(int argument_count, char **argument_values) {
     snprintf(path, sizeof(path), "packages/%s.json", alias);
     char error[PKG_ERROR_SIZE];
     JsonValue *document = NULL;
-    if (!pkg_json_fetch(base, path, &document, error, sizeof(error))) {
+    if (!pkg_json_fetch(base, path,
+                        manifest ? &manifest->package_trust : NULL,
+                        &document, error, sizeof(error))) {
         pkg_error("%s", error[0] ? error : "Registry lookup failed.");
         if (manifest)
             gpm_manifest_free(manifest);
@@ -1149,8 +1158,9 @@ static int command_search(int argument_count, char **argument_values) {
     }
     char error[PKG_ERROR_SIZE];
     JsonValue *document = NULL;
-    if (!pkg_json_fetch(base, "index.json", &document, error,
-                        sizeof(error))) {
+    if (!pkg_json_fetch(base, "index.json",
+                        manifest ? &manifest->package_trust : NULL,
+                        &document, error, sizeof(error))) {
         pkg_error("%s", error[0] ? error : "Registry lookup failed.");
         if (manifest)
             gpm_manifest_free(manifest);
@@ -1855,6 +1865,203 @@ static int command_verify(int argument_count, char **argument_values) {
     return 0;
 }
 
+/* sign-file/verify-file cover detached signatures over raw file bytes —
+   the same GENESIS-SIG-1 envelope format used for registry documents
+   (docs/registry.md) and native extension binaries (Genesis
+   docs/signing.md), where the payload is the file contents verbatim
+   rather than the canonical gpm-package-v1 payload. */
+
+static bool file_signing_args_parse(int argument_count,
+                                    char **argument_values,
+                                    const char **key_path,
+                                    const char **public_key_text,
+                                    const char **file_path,
+                                    const char **sig_path) {
+    *key_path = NULL;
+    *public_key_text = NULL;
+    *file_path = NULL;
+    *sig_path = NULL;
+    for (int index = 2; index < argument_count; index++) {
+        const char *arg = argument_values[index];
+        const char **slot = NULL;
+        if (!strcmp(arg, "--key") && index + 1 < argument_count)
+            slot = key_path;
+        else if (!strcmp(arg, "--pubkey") && index + 1 < argument_count)
+            slot = public_key_text;
+        else if (arg[0] != '-' && !*file_path)
+            *file_path = arg;
+        else if (arg[0] != '-' && *file_path && !*sig_path)
+            *sig_path = arg;
+        else {
+            pkg_error("Unknown argument '%s'.", arg);
+            return false;
+        }
+        if (slot) {
+            if (*slot) {
+                pkg_error("Duplicate argument '%s'.", arg);
+                return false;
+            }
+            *slot = argument_values[++index];
+        }
+    }
+    return true;
+}
+
+static int command_sign_file(int argument_count, char **argument_values) {
+    const char *key_path, *public_key_text, *file_path, *sig_path;
+    if (!file_signing_args_parse(argument_count, argument_values, &key_path,
+                                 &public_key_text, &file_path, &sig_path) ||
+        !key_path || public_key_text || !file_path) {
+        pkg_error("Usage: gpm sign-file --key <keyfile> <file> "
+                  "[signature.sig]");
+        return 1;
+    }
+    uint8_t secret_key[GENESIS_SECRET_KEY_BYTES];
+    if (!gpm_key_file_load(key_path, secret_key)) {
+        pkg_error("Cannot read secret key '%s'.", key_path);
+        return 1;
+    }
+    size_t payload_length = 0;
+    char *payload = pkg_read_file(file_path, &payload_length);
+    if (!payload) {
+        pkg_error("Cannot read file '%s'.", file_path);
+        return 1;
+    }
+    const uint8_t *public_key = secret_key + 32;
+    uint8_t key_id[GENESIS_KEY_ID_BYTES];
+    uint8_t signature[GENESIS_SIGNATURE_BYTES];
+    genesis_signature_key_id(public_key, key_id);
+    genesis_signature_sign((const uint8_t *)payload, payload_length,
+                           secret_key, signature);
+    free(payload);
+    char *envelope = genesis_signature_envelope_format(key_id, signature);
+    if (!envelope) {
+        pkg_error("Out of memory.");
+        return 1;
+    }
+    char *out_path = NULL;
+    if (sig_path) {
+        out_path = gpm_strdup(sig_path);
+    } else {
+        size_t length = strlen(file_path) + 5;
+        out_path = (char *)malloc(length);
+        if (out_path)
+            snprintf(out_path, length, "%s.sig", file_path);
+    }
+    if (!out_path) {
+        pkg_error("Out of memory.");
+        free(envelope);
+        return 1;
+    }
+    FILE *file = fopen(out_path, "wb");
+    bool ok = file != NULL;
+    if (ok) {
+        ok = fputs(envelope, file) >= 0;
+        if (fclose(file) != 0)
+            ok = false;
+    }
+    free(envelope);
+    if (!ok) {
+        pkg_error("Cannot write signature '%s'.", out_path);
+        free(out_path);
+        return 1;
+    }
+    printf("Wrote %s\n", out_path);
+    free(out_path);
+    return 0;
+}
+
+static int command_verify_file(int argument_count, char **argument_values) {
+    const char *key_path, *public_key_text, *file_path, *sig_path;
+    if (!file_signing_args_parse(argument_count, argument_values, &key_path,
+                                 &public_key_text, &file_path, &sig_path) ||
+        !file_path || (key_path != NULL) == (public_key_text != NULL)) {
+        pkg_error("Usage: gpm verify-file --key <keyfile> | --pubkey "
+                  "<base64url> <file> [signature.sig]");
+        return 1;
+    }
+    uint8_t public_key[GENESIS_PUBLIC_KEY_BYTES];
+    if (key_path) {
+        uint8_t secret_key[GENESIS_SECRET_KEY_BYTES];
+        if (!gpm_key_file_load(key_path, secret_key)) {
+            pkg_error("Cannot read secret key '%s'.", key_path);
+            return 1;
+        }
+        memcpy(public_key, secret_key + 32, GENESIS_PUBLIC_KEY_BYTES);
+    } else {
+        size_t decoded = 0;
+        if (!genesis_signature_base64url_decode(
+                public_key_text, strlen(public_key_text), public_key,
+                GENESIS_PUBLIC_KEY_BYTES, &decoded) ||
+            decoded != GENESIS_PUBLIC_KEY_BYTES) {
+            pkg_error("'--pubkey' is not a valid base64url 32-byte "
+                      "public key.");
+            return 1;
+        }
+    }
+    size_t payload_length = 0;
+    char *payload = pkg_read_file(file_path, &payload_length);
+    if (!payload) {
+        pkg_error("Cannot read file '%s'.", file_path);
+        return 1;
+    }
+    char *out_path = NULL;
+    if (!sig_path) {
+        size_t length = strlen(file_path) + 5;
+        out_path = (char *)malloc(length);
+        if (out_path)
+            snprintf(out_path, length, "%s.sig", file_path);
+        sig_path = out_path;
+    }
+    if (!sig_path) {
+        pkg_error("Out of memory.");
+        free(payload);
+        return 1;
+    }
+    size_t envelope_length = 0;
+    char *envelope = pkg_read_file(sig_path, &envelope_length);
+    if (!envelope) {
+        pkg_error("Cannot read signature '%s'.", sig_path);
+        free(payload);
+        free(out_path);
+        return 1;
+    }
+    uint8_t envelope_key_id[GENESIS_KEY_ID_BYTES];
+    uint8_t envelope_signature[GENESIS_SIGNATURE_BYTES];
+    bool ok = genesis_signature_envelope_parse(
+        envelope, envelope_length, envelope_key_id, envelope_signature);
+    free(envelope);
+    if (!ok) {
+        pkg_error("'%s' is not a valid GENESIS-SIG-1 envelope.", sig_path);
+        free(payload);
+        free(out_path);
+        return 1;
+    }
+    uint8_t expected_key_id[GENESIS_KEY_ID_BYTES];
+    genesis_signature_key_id(public_key, expected_key_id);
+    if (memcmp(expected_key_id, envelope_key_id, GENESIS_KEY_ID_BYTES)) {
+        pkg_error("Signature keyId does not match the supplied public "
+                  "key.");
+        free(payload);
+        free(out_path);
+        return 1;
+    }
+    ok = genesis_signature_verify((const uint8_t *)payload, payload_length,
+                                  envelope_signature, public_key);
+    free(payload);
+    free(out_path);
+    if (!ok) {
+        pkg_error("Signature verification failed for '%s'.", file_path);
+        return 1;
+    }
+    char key_id_text[GENESIS_KEY_ID_BYTES * 2 + 1];
+    genesis_signature_base64url_encode(expected_key_id,
+                                     GENESIS_KEY_ID_BYTES, key_id_text,
+                                     sizeof(key_id_text));
+    printf("Verified %s signature (keyId %s)\n", file_path, key_id_text);
+    return 0;
+}
+
 static void usage(void) {
     fprintf(stderr,
             "Usage: gpm <command>\n"
@@ -1889,6 +2096,11 @@ static void usage(void) {
             "<archive>.sig.\n"
             "  verify --key K|--pubkey P --alias a (--version v|--commit c)\n"
             "          <archive> [sig] Verify a package signature.\n"
+            "  sign-file --key K <file> [sig]\n"
+            "                          Sign raw file bytes (registry "
+            "documents, extension binaries), writing <file>.sig.\n"
+            "  verify-file --key K|--pubkey P <file> [sig]\n"
+            "                          Verify a raw-bytes file signature.\n"
             "\n"
             "See docs/package-manager.md for the package format and "
             "docs/signing.md for package signing.\n");
@@ -1925,6 +2137,10 @@ int main(int argument_count, char **argument_values) {
         return command_sign(argument_count, argument_values);
     if (!strcmp(command, "verify") && argument_count >= 3)
         return command_verify(argument_count, argument_values);
+    if (!strcmp(command, "sign-file") && argument_count >= 3)
+        return command_sign_file(argument_count, argument_values);
+    if (!strcmp(command, "verify-file") && argument_count >= 3)
+        return command_verify_file(argument_count, argument_values);
     usage();
     return 1;
 }

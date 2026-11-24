@@ -163,6 +163,13 @@ New/changed surface (names TBD, lowerCamelCase per convention):
   alias+description. Local filtering; no server-side search.
 - `gpm remove`, `gpm update`, `gpm check`, `gpm tree` unchanged —
   they operate on the lockfile, which is registry-agnostic.
+- Registry document signatures: `packages/<alias>.json.sig` and
+  `index.json.sig` are `GENESIS-SIG-1` envelopes over the raw file
+  bytes, produced with `gpm sign-file`. `add <alias>`/`info`/`search`
+  fetch the sidecar when `trustedPackageKeys` is configured: a
+  signature by a pinned keyId must verify or the command fails; a
+  missing sidecar or an unpinned signer is ignored (metadata is
+  advisory — package signatures remain the enforcement point).
 
 Version selection in v1: `latest` from the package doc, or explicit
 `--version`. No semver ranges (`^`, `~`) — consistent with the current
@@ -196,8 +203,14 @@ to the registry repo. The `signature` field can carry their
    `gpm_resolver_end_to_end` (file:// registry fixture).
 3. Registry repo + docs (`docs/package-manager.md` registry section,
    authoring guide for `packages/<alias>.json`).
-4. First-party registry key once the release key exists — sign
-   `index.json`/package docs, document pinning.
+4. [x] First-party registry key + document signatures: the Genesis
+   release key (`keyId V150wSILeV62J7XY36sz3g`) signs `index.json` and
+   `packages/*.json` raw bytes via `gpm sign-file`; `index.json.sig` and
+   `packages/json-tools.json.sig` are live in `genesis-registry`.
+   `add <alias>`/`info`/`search` verify `<doc>.sig` against
+   `trustedPackageKeys` — pinned signatures must verify, absent
+   sidecars and unpinned signers are ignored (metadata is advisory).
+   Covered by `gpm_resolver_end_to_end`.
 5. Later (only if needed): hosted registry service, semver ranges,
    namespacing beyond `@author/`, federation between registries.
 
@@ -209,8 +222,9 @@ to the registry repo. The `signature` field can carry their
    <alias>` with zero config fails with a clear error while
    `add github:...` always works.
 2. **Package-doc signature scope**: ~~raw file bytes vs canonical
-   JSON~~ — **decided: raw file bytes** when `.sig` files land (slice
-   4, pending the first-party key).
+   JSON~~ — **decided and implemented: raw file bytes**. `gpm
+   sign-file` produces the `.sig`; verification lives in
+   `gpm_registry_verify_document` (slice 4).
 3. **`latest` semantics**: ~~highest semver in `versions`, or an
    explicit `"latest": "X.Y.Z"` field~~ — **decided: explicit field**,
    already reflected in the format above. Allows yanking and matches

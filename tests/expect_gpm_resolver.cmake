@@ -480,4 +480,60 @@ file(REMOVE_RECURSE "${PROJECT}/.genesis/packages/signedpkg")
 run_pkg(UPDATE_BAD_RESULT update signedpkg)
 require_fail(UPDATE_BAD_RESULT "not listed in trustedPackageKeys")
 
+# --- signed registry documents (docs/registry.md trust model) --------------
+# packages/<alias>.json.sig and index.json.sig sign the raw document bytes
+# with the same GENESIS-SIG-1 envelope; gpm sign-file produces them.
+# Verification is advisory: absent sidecars and unpinned signers are
+# ignored, but a pinned signature that fails is a hard error.
+run_pkg(SIGNFILE_RESULT sign-file --key "${pkg_key_file}"
+        "${REGISTRY_DIR}/packages/gizmo.json")
+require_ok(SIGNFILE_RESULT)
+if(NOT EXISTS "${REGISTRY_DIR}/packages/gizmo.json.sig")
+  message(FATAL_ERROR "gpm sign-file did not produce the sidecar")
+endif()
+run_pkg(SIGNFILE_INDEX sign-file --key "${pkg_key_file}"
+        "${REGISTRY_DIR}/index.json")
+require_ok(SIGNFILE_INDEX)
+run_pkg(VERIFYFILE_RESULT verify-file --key "${pkg_key_file}"
+        "${REGISTRY_DIR}/packages/gizmo.json")
+require_ok(VERIFYFILE_RESULT)
+
+# Signed docs verify cleanly through info (package doc) and search (index).
+run_pkg(REG_SIG_INFO info gizmo)
+require_ok(REG_SIG_INFO)
+if(NOT last_stdout MATCHES "@acme/gizmo")
+  message(FATAL_ERROR "signed registry info failed: ${last_stdout}")
+endif()
+run_pkg(REG_SIG_SEARCH search giz)
+require_ok(REG_SIG_SEARCH)
+
+# A signature from an unpinned key is ignored, not an error.
+run_pkg(SIGNFILE_OTHER sign-file --key "${other_key_file}"
+        "${REGISTRY_DIR}/packages/gizmo.json"
+        "${REGISTRY_DIR}/packages/gizmo.json.sig")
+require_ok(SIGNFILE_OTHER)
+run_pkg(REG_UNPINNED_INFO info gizmo)
+require_ok(REG_UNPINNED_INFO)
+
+# Restore the pinned signature, then prove tampering is caught: the doc
+# bytes are covered exactly, so any edit fails verification.
+run_pkg(SIGNFILE_RESTORE sign-file --key "${pkg_key_file}"
+        "${REGISTRY_DIR}/packages/gizmo.json"
+        "${REGISTRY_DIR}/packages/gizmo.json.sig")
+require_ok(SIGNFILE_RESTORE)
+file(READ "${REGISTRY_DIR}/packages/gizmo.json" gizmo_doc)
+file(WRITE "${REGISTRY_DIR}/packages/gizmo.json" "${gizmo_doc} ")
+run_pkg(REG_TAMPER_INFO info gizmo)
+require_fail(REG_TAMPER_INFO "signature verification failed")
+# The add path verifies too: resolution fails before version selection.
+file(READ "${REGISTRY_DIR}/packages/widgets-legacy.json" wl_doc)
+file(WRITE "${REGISTRY_DIR}/packages/widgets-legacy.json" "${wl_doc}")
+run_pkg(SIGNFILE_WL sign-file --key "${pkg_key_file}"
+        "${REGISTRY_DIR}/packages/widgets-legacy.json"
+        "${REGISTRY_DIR}/packages/widgets-legacy.json.sig")
+require_ok(SIGNFILE_WL)
+file(APPEND "${REGISTRY_DIR}/packages/widgets-legacy.json" " ")
+run_pkg(REG_TAMPER_ADD add widgets-legacy --version 1.0.0)
+require_fail(REG_TAMPER_ADD "signature verification failed")
+
 message(STATUS "gpm resolver end-to-end test passed")

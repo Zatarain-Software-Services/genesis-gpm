@@ -169,13 +169,19 @@ unless the project sets `signedPackagesRequired`.
   (LF separators, no trailing newline), binding package identity and
   content hash. The version-or-commit field is the package manifest's
   `version` when present, otherwise the pinned commit.
-- `gpm` ships three subcommands: `gpm keygen` generates an Ed25519
+- `gpm` ships signing subcommands: `gpm keygen` generates an Ed25519
   keypair into `~/.config/genesis/keys/<keyId>.key` (mode 0600; override
   the directory with `GPM_KEYS_DIR`) and prints the keyId/publicKey pair
   to pin; `gpm sign --key <keyfile> --alias <a> (--version <v> |
   --commit <c>) <archive>` writes `<archive>.sig`; `gpm verify --key
   <keyfile>` or `--pubkey <base64url>` checks a `.sig` against an
   archive. Private keys never enter `genesis.json`.
+- `gpm sign-file --key <keyfile> <file> [sig]` and `gpm verify-file
+  --key <keyfile> | --pubkey <base64url> <file> [sig]` sign and verify
+  **raw file bytes** — the same GENESIS-SIG-1 envelope with the file
+  contents as the payload. This is the format registry documents
+  (`<doc>.sig` sidecars, see [the registry design](registry.md)) and
+  native extension binaries use.
 
 ## Lockfile
 
@@ -296,7 +302,12 @@ implementation, but the operations are fixed:
 - Registry access adds one more operator-facing override:
   `GPM_REGISTRY_URL` replaces the manifest's `registry` field (and is
   itself overridden by `--registry`). Registry documents are fetched
-  with `curl`, so `file://` URLs work for tests and mirrors.
+  with `curl`, so `file://` URLs work for tests and mirrors. When a
+  registry publishes `<doc>.sig` sidecars (raw-bytes signatures per
+  [registry.md](registry.md)), `add <alias>`/`info`/`search` verify them
+  against `trustedPackageKeys`: pinned signatures must verify, while
+  absent sidecars and unpinned signers are ignored because registry
+  metadata is advisory.
 - Two environment overrides exist for mirrors and offline testing:
   `GPM_GIT_BASE_URL` replaces `https://github.com` as the repository base
   (`<base>/<owner>/<repo>` is passed to `git ls-remote`), and

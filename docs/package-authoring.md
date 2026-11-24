@@ -243,7 +243,16 @@ shasum -a 256 pkg.tar.gz   # macOS; sha256sum on Linux
 4. `gpm verify --pubkey <pub> --alias <alias> --version X.Y.Z pkg.tar.gz pkg.tar.gz.sig`.
 5. Update `packages/<alias>.json` in `genesis-registry`: new version
    entry (source/commit/sha256/signature) + bump `latest` + `index.json`
-   entry if the alias is new.
+   entry if the alias is new. Then re-sign the changed documents so the
+   registry's `.sig` sidecars stay valid:
+
+   ```sh
+   gpm sign-file --key <registry-keyfile> packages/<alias>.json
+   gpm sign-file --key <registry-keyfile> index.json   # if it changed
+   ```
+
+   (`gpm sign-file` signs raw file bytes — the same envelope format as
+   package and extension signatures.)
 6. Announce the `keyId`/`publicKey` pair so consumers can pin it.
 
 ## 8. Consumer quickstart (for your README)

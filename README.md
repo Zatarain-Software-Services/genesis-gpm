@@ -28,6 +28,7 @@ gpm install [--frozen]
 gpm update [alias]
 gpm tree
 gpm keygen / sign / verify   # package signing
+gpm sign-file / verify-file  # raw-bytes signatures (registry docs, extension binaries)
 ```
 
 See `gpm --help` and the docs for details.
