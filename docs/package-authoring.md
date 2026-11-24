@@ -263,3 +263,14 @@ shasum -a 256 pkg.tar.gz   # macOS; sha256sum on Linux
 ```sh
 gpm add my-package          # resolves via registry, verifies signature
 ```
+
+### Typed APIs and consumer unwraps
+
+Exported signatures resolve their type names in the *exporter's* scope,
+so consumers do not need to re-import types your signatures mention.
+Nullable returns still follow normal Genesis semantics, though: a
+function returning `JsonValue?` requires the consumer to unwrap with
+`as JsonValue`, which in turn requires them to import `JsonValue`
+themselves (e.g. `import { JsonValue } from "@std/json"`). When
+designing a typed package API, prefer concrete return types or document
+which stdlib types consumers must import to unwrap nullable results.
