@@ -51,8 +51,11 @@ function(publish_package REPO_NAME DEPS_JSON OUT_SHA)
   execute_process(COMMAND git -C "${repo_dir}" rev-parse HEAD
                   OUTPUT_VARIABLE pkg_sha OUTPUT_STRIP_TRAILING_WHITESPACE)
   write_package("${tar_dir}" "${REPO_NAME}" "${DEPS_JSON}")
-  execute_process(COMMAND tar -czf "${WORK}/${REPO_NAME}-${pkg_sha}.tar.gz"
-                        -C "${WORK}/tarbuild" "${REPO_NAME}")
+  # Archive name stays relative: GNU tar reads "C:/..." in -f as a remote
+  # host, so WORKING_DIRECTORY keeps the path drive-letter-free everywhere.
+  execute_process(COMMAND tar -czf "${REPO_NAME}-${pkg_sha}.tar.gz"
+                        -C "${WORK}/tarbuild" "${REPO_NAME}"
+                  WORKING_DIRECTORY "${WORK}")
   file(RENAME "${WORK}/${REPO_NAME}-${pkg_sha}.tar.gz"
        "${ARCHIVES}/acme/${REPO_NAME}/tar.gz/${pkg_sha}")
   set(${OUT_SHA} "${pkg_sha}" PARENT_SCOPE)
@@ -89,8 +92,9 @@ foreach(pkg widgets gadgets)
   endif()
   file(MAKE_DIRECTORY "${WORK}/tarbuild/${pkg}")
   write_package("${WORK}/tarbuild/${pkg}" "${pkg}" "${pkg_deps}")
-  execute_process(COMMAND tar -czf "${WORK}/${pkg}-${pkg_sha}.tar.gz"
-                        -C "${WORK}/tarbuild" "${pkg}")
+  execute_process(COMMAND tar -czf "${pkg}-${pkg_sha}.tar.gz"
+                        -C "${WORK}/tarbuild" "${pkg}"
+                  WORKING_DIRECTORY "${WORK}")
   # The archive URL ends in the commit SHA, so the payload must be a file
   # literally named by that SHA under the tar.gz directory.
   file(RENAME "${WORK}/${pkg}-${pkg_sha}.tar.gz"
@@ -218,8 +222,9 @@ file(MAKE_DIRECTORY "${WORK}/tarbuild/widgets-v2")
 write_package("${WORK}/tarbuild/widgets-v2" "widgets"
               "{\"gadgets\": \"github:acme/gadgets\"}")
 file(APPEND "${WORK}/tarbuild/widgets-v2/index.genesis" "// v2\n")
-execute_process(COMMAND tar -czf "${WORK}/widgets-v2.tar.gz"
-                      -C "${WORK}/tarbuild" "widgets-v2")
+execute_process(COMMAND tar -czf "widgets-v2.tar.gz"
+                      -C "${WORK}/tarbuild" "widgets-v2"
+                WORKING_DIRECTORY "${WORK}")
 # The archive top-level directory name is irrelevant (strip-components=1),
 # so reuse the widgets path for the new commit's archive.
 file(RENAME "${WORK}/widgets-v2.tar.gz"

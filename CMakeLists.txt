@@ -72,14 +72,13 @@ if(BUILD_TESTING)
         -DFIXTURE=${_gpm_fixture}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_gpm.cmake)
   endforeach()
-  if(NOT WIN32)
-    # Resolver end-to-end: local git repo + file:// archive stand in for
-    # github.com/codeload via the GPM_*_BASE_URL overrides; the registry
-    # scenarios use a file:// registry tree via GPM_REGISTRY_URL.
-    add_test(NAME gpm_resolver_end_to_end
-      COMMAND ${CMAKE_COMMAND}
-        -DPKG=$<TARGET_FILE:gpm>
-        -DWORK=${CMAKE_BINARY_DIR}/gpm-tests/resolver_end_to_end
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_gpm_resolver.cmake)
-  endif()
+  # Resolver end-to-end: local git repo + file:// archive stand in for
+  # github.com/codeload via the GPM_*_BASE_URL overrides; the registry
+  # scenarios use a file:// registry tree via GPM_REGISTRY_URL. Requires
+  # git, curl, and tar on PATH (git-for-windows ships all three on Windows).
+  add_test(NAME gpm_resolver_end_to_end
+    COMMAND ${CMAKE_COMMAND}
+      -DPKG=$<TARGET_FILE:gpm>
+      -DWORK=${CMAKE_BINARY_DIR}/gpm-tests/resolver_end_to_end
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_gpm_resolver.cmake)
 endif()

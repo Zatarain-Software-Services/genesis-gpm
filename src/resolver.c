@@ -13,15 +13,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if !defined(_WIN32)
-#include <strings.h>
 #include <sys/stat.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#define resolver_strcasecmp _stricmp
+#else
+#include <strings.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#define resolver_strcasecmp strcasecmp
 #endif
 
-#if !defined(_WIN32)
+#include "signing.h"
 
 #define RESOLVER_ERROR_SIZE 512
 #define GIT_SHA_LENGTH 40
@@ -44,6 +49,8 @@ static char *resolver_strdup(const char *text) {
         memcpy(copy, text, length);
     return copy;
 }
+
+#if !defined(_WIN32)
 
 /* Runs argv[0] with arguments, capturing stdout into output (may be NULL to
    discard). Returns true only when the process exits with status 0. */
@@ -99,6 +106,199 @@ static bool resolver_run_capture(char *const argv[], char *output,
     }
     return true;
 }
+
+#else /* _WIN32 */
+
+/* Appends one CommandLineToArgvW-compatible quoted argument to buffer,
+   which must have room for the worst case (every byte escaped). Backslashes
+   are literal unless they precede a quote or the closing quote. */
+static void resolver_append_arg(char *buffer, size_t *used,
+                                const char *arg) {
+    size_t length = strlen(arg);
+    buffer[(*used)++] = '"';
+    for (size_t index = 0; index < length; index++) {
+        if (arg[index] == '"') {
+            buffer[(*used)++] = '\\';
+            buffer[(*used)++] = '"';
+        } else if (arg[index] == '\\') {
+            size_t run = 1;
+            while (index + run < length && arg[index + run] == '\\')
+                run++;
+            bool doubled = index + run == length || arg[index + run] == '"';
+            for (size_t mark = 0; mark < run * (doubled ? 2 : 1); mark++)
+                buffer[(*used)++] = '\\';
+            index += run - 1;
+        } else {
+            buffer[(*used)++] = arg[index];
+        }
+    }
+    buffer[(*used)++] = '"';
+}
+
+/* Joins argv into a single CreateProcess command line. */
+static char *resolver_join_argv(char *const argv[]) {
+    size_t needed = 1;
+    for (size_t index = 0; argv[index]; index++)
+        needed += strlen(argv[index]) * 2 + 4;
+    char *line = (char *)malloc(needed);
+    if (!line)
+        return NULL;
+    size_t used = 0;
+    for (size_t index = 0; argv[index]; index++) {
+        if (index)
+            line[used++] = ' ';
+        resolver_append_arg(line, &used, argv[index]);
+    }
+    line[used] = '\0';
+    return line;
+}
+
+/* Runs argv[0] with arguments on Windows, capturing stdout into a malloc'd
+   NUL-terminated buffer (*out_buf, *out_len). Returns false only when the
+   process could not be started or its output could not be read; the exit
+   code is reported through exit_code_out either way. */
+static bool resolver_spawn_capture(char *const argv[], char **out_buf,
+                                   size_t *out_len, DWORD *exit_code_out,
+                                   char *error_buffer, size_t error_capacity) {
+    *out_buf = NULL;
+    *out_len = 0;
+    *exit_code_out = 1;
+
+    SECURITY_ATTRIBUTES sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE read_pipe = NULL;
+    HANDLE write_pipe = NULL;
+    if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0)) {
+        resolver_error(error_buffer, error_capacity,
+                       "Could not create a pipe for '%s'.", argv[0]);
+        return false;
+    }
+    /* The read end must not leak into the child. */
+    SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
+
+    char *command_line = resolver_join_argv(argv);
+    if (!command_line) {
+        CloseHandle(read_pipe);
+        CloseHandle(write_pipe);
+        resolver_error(error_buffer, error_capacity, "Out of memory.");
+        return false;
+    }
+    int wide_length = MultiByteToWideChar(CP_UTF8, 0, command_line, -1, NULL,
+                                        0);
+    wchar_t *wide_command = wide_length > 0
+                                ? (wchar_t *)malloc((size_t)wide_length *
+                                                    sizeof(wchar_t))
+                                : NULL;
+    if (!wide_command ||
+        MultiByteToWideChar(CP_UTF8, 0, command_line, -1, wide_command,
+                            wide_length) == 0) {
+        free(wide_command);
+        free(command_line);
+        CloseHandle(read_pipe);
+        CloseHandle(write_pipe);
+        resolver_error(error_buffer, error_capacity, "Out of memory.");
+        return false;
+    }
+    free(command_line);
+
+    STARTUPINFOW startup;
+    memset(&startup, 0, sizeof(startup));
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = write_pipe;
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+    PROCESS_INFORMATION process;
+    memset(&process, 0, sizeof(process));
+    BOOL created = CreateProcessW(NULL, wide_command, NULL, NULL, TRUE, 0,
+                                  NULL, NULL, &startup, &process);
+    free(wide_command);
+    CloseHandle(write_pipe);
+    if (!created) {
+        CloseHandle(read_pipe);
+        resolver_error(error_buffer, error_capacity,
+                       "Could not start '%s'.", argv[0]);
+        return false;
+    }
+
+    size_t capacity = 8192;
+    size_t used = 0;
+    char *body = (char *)malloc(capacity + 1);
+    if (!body) {
+        CloseHandle(read_pipe);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        resolver_error(error_buffer, error_capacity, "Out of memory.");
+        return false;
+    }
+    char chunk[8192];
+    DWORD received = 0;
+    for (;;) {
+        if (!ReadFile(read_pipe, chunk, sizeof(chunk), &received, NULL) ||
+            received == 0)
+            break;
+        if (used + received + 1 > capacity) {
+            while (used + received + 1 > capacity)
+                capacity *= 2;
+            char *grown = (char *)realloc(body, capacity + 1);
+            if (!grown) {
+                free(body);
+                CloseHandle(read_pipe);
+                CloseHandle(process.hThread);
+                CloseHandle(process.hProcess);
+                resolver_error(error_buffer, error_capacity,
+                               "Out of memory.");
+                return false;
+            }
+            body = grown;
+        }
+        memcpy(body + used, chunk, received);
+        used += received;
+    }
+    CloseHandle(read_pipe);
+    WaitForSingleObject(process.hProcess, INFINITE);
+    GetExitCodeProcess(process.hProcess, exit_code_out);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    body[used] = '\0';
+    *out_buf = body;
+    *out_len = used;
+    return true;
+}
+
+/* Runs argv[0] with arguments, capturing stdout into output (may be NULL to
+   discard). Returns true only when the process exits with status 0. */
+static bool resolver_run_capture(char *const argv[], char *output,
+                                 size_t output_capacity, char *error_buffer,
+                                 size_t error_capacity) {
+    char *body = NULL;
+    size_t length = 0;
+    DWORD exit_code = 1;
+    if (!resolver_spawn_capture(argv, &body, &length, &exit_code,
+                                error_buffer, error_capacity)) {
+        free(body);
+        return false;
+    }
+    if (output && output_capacity) {
+        size_t copy = length < output_capacity ? length : output_capacity - 1;
+        memcpy(output, body, copy);
+        output[copy] = '\0';
+    }
+    free(body);
+    if (exit_code != 0) {
+        resolver_error(error_buffer, error_capacity,
+                       "'%s' failed (exit status %lu).", argv[0],
+                       (unsigned long)exit_code);
+        return false;
+    }
+    return true;
+}
+
+#endif /* !_WIN32 */
 
 /* --- source specifier parsing ------------------------------------------- */
 
@@ -290,42 +490,23 @@ bool gpm_resolve_commit(const GpmSource *source, char *sha_out,
 
 static bool resolver_sha256_file(const char *path, char hex_out[SHA256_LENGTH + 1],
                                 char *error_buffer, size_t error_capacity) {
-    char *digest_argv[] = {"sha256sum", (char *)path, NULL};
-    char *output = (char *)malloc(4096);
-    if (!output) {
-        resolver_error(error_buffer, error_capacity, "Out of memory.");
-        return false;
-    }
-    bool ok = resolver_run_capture(digest_argv, output, 4096, error_buffer,
-                                   error_capacity);
-    if (!ok) {
-        /* macOS ships shasum instead of sha256sum. */
-        char *fallback_argv[] = {"shasum", "-a", "256", (char *)path, NULL};
-        ok = resolver_run_capture(fallback_argv, output, 4096, error_buffer,
-                                  error_capacity);
-    }
-    if (!ok) {
-        free(output);
-        return false;
-    }
-    if (strlen(output) < SHA256_LENGTH ||
-        !resolver_is_hex(output, SHA256_LENGTH)) {
+    /* Portable SHA-256 from signing.c — no sha256sum/shasum dependency. */
+    if (!gpm_sha256_file_hex(path, hex_out)) {
         resolver_error(error_buffer, error_capacity,
-                       "Could not parse the SHA-256 digest of '%s'.", path);
-        free(output);
+                       "Could not compute the SHA-256 digest of '%s'.", path);
         return false;
     }
-    memcpy(hex_out, output, SHA256_LENGTH);
-    hex_out[SHA256_LENGTH] = '\0';
-    for (size_t index = 0; index < SHA256_LENGTH; index++)
-        hex_out[index] = (char)tolower((unsigned char)hex_out[index]);
-    free(output);
     return true;
 }
 
 static bool resolver_file_exists(const char *path) {
+#if defined(_WIN32)
+    struct _stat status;
+    return _stat(path, &status) == 0 && (status.st_mode & _S_IFREG);
+#else
     struct stat status;
     return stat(path, &status) == 0 && S_ISREG(status.st_mode);
+#endif
 }
 
 bool gpm_fetch_package(const GpmSource *source, const char *commit,
@@ -368,26 +549,26 @@ bool gpm_fetch_package(const GpmSource *source, const char *commit,
     char actual_sha256[SHA256_LENGTH + 1];
     if (!resolver_sha256_file(archive_path, actual_sha256, error_buffer,
                               error_capacity)) {
-        unlink(archive_path);
+        remove(archive_path);
         return false;
     }
     if (actual_sha256_out)
         memcpy(actual_sha256_out, actual_sha256, sizeof(actual_sha256));
     if (expected_sha256 &&
-        strcasecmp(actual_sha256, expected_sha256) != 0) {
+        resolver_strcasecmp(actual_sha256, expected_sha256) != 0) {
         resolver_error(error_buffer, error_capacity,
                        "Archive SHA-256 mismatch for %s/%s at %s: expected "
                        "%s, got %s.",
                        source->owner, source->repo, commit, expected_sha256,
                        actual_sha256);
-        unlink(archive_path);
+        remove(archive_path);
         return false;
     }
     char *tar_argv[] = {"tar", "-xzf", archive_path, "-C", (char *)staging_dir,
                         "--strip-components=1", NULL};
     bool ok = resolver_run_capture(tar_argv, NULL, 0, error_buffer,
                                    error_capacity);
-    unlink(archive_path);
+    remove(archive_path);
     if (!ok) {
         resolver_error(error_buffer, error_capacity,
                        "Could not unpack the package archive for %s/%s.",
@@ -477,6 +658,8 @@ static char *resolver_read_text_file(const char *path, size_t *length_out) {
     return text;
 }
 
+#if !defined(_WIN32)
+
 /* Fetches url via curl and returns the body as a malloc'd string. The
    capture buffer grows on demand so index/package documents of any
    reasonable size work without a fixed cap. */
@@ -551,6 +734,35 @@ bool gpm_fetch_text_url(const char *url, char **out_text,
     return true;
 }
 
+#else /* _WIN32 */
+
+/* Fetches url via curl and returns the body as a malloc'd string; the
+   captured buffer grows on demand like the POSIX path. */
+bool gpm_fetch_text_url(const char *url, char **out_text,
+                        char *error_buffer, size_t error_capacity) {
+    *out_text = NULL;
+    char *curl_argv[] = {"curl", "-fsSL", (char *)url, NULL};
+    char *body = NULL;
+    size_t length = 0;
+    DWORD exit_code = 1;
+    if (!resolver_spawn_capture(curl_argv, &body, &length, &exit_code,
+                                error_buffer, error_capacity)) {
+        free(body);
+        return false;
+    }
+    if (exit_code != 0) {
+        free(body);
+        resolver_error(error_buffer, error_capacity,
+                       "Could not fetch '%s' (curl exit status %lu).", url,
+                       (unsigned long)exit_code);
+        return false;
+    }
+    *out_text = body;
+    return true;
+}
+
+#endif /* !_WIN32 */
+
 bool gpm_fetch_package_signature(const GpmSource *source,
                                  const char *commit,
                                  const char *staging_dir,
@@ -586,12 +798,12 @@ bool gpm_fetch_package_signature(const GpmSource *source,
        package is unsigned, so any failure leaves envelope_out NULL. */
     resolver_run_capture(download_argv, NULL, 0, NULL, 0);
     if (!resolver_file_exists(sig_path)) {
-        unlink(sig_path);
+        remove(sig_path);
         return true;
     }
     size_t length = 0;
     char *envelope = resolver_read_text_file(sig_path, &length);
-    unlink(sig_path);
+    remove(sig_path);
     if (!envelope) {
         resolver_error(error_buffer, error_capacity,
                        "Could not read the package signature sidecar.");
@@ -600,74 +812,3 @@ bool gpm_fetch_package_signature(const GpmSource *source,
     *envelope_out = envelope;
     return true;
 }
-
-#else /* _WIN32: resolver needs git/curl/tar/sha256sum, all POSIX tools. */
-
-static void resolver_unsupported(char *error_buffer, size_t error_capacity) {
-    if (error_buffer && error_capacity)
-        snprintf(error_buffer, error_capacity,
-                 "Package resolution is not supported on Windows yet.");
-}
-
-bool gpm_source_parse(const char *source, GpmSource *out,
-                      char *error_buffer, size_t error_capacity) {
-    (void)source;
-    memset(out, 0, sizeof(*out));
-    resolver_unsupported(error_buffer, error_capacity);
-    return false;
-}
-
-void gpm_source_free(GpmSource *source) {
-    if (!source)
-        return;
-    free(source->owner);
-    free(source->repo);
-    free(source->ref);
-    memset(source, 0, sizeof(*source));
-}
-
-bool gpm_resolve_commit(const GpmSource *source, char *sha_out,
-                        char *error_buffer, size_t error_capacity) {
-    (void)source;
-    (void)sha_out;
-    resolver_unsupported(error_buffer, error_capacity);
-    return false;
-}
-
-bool gpm_fetch_package(const GpmSource *source, const char *commit,
-                       const char *expected_sha256, const char *staging_dir,
-                       char *actual_sha256_out, char *error_buffer,
-                       size_t error_capacity) {
-    (void)source;
-    (void)commit;
-    (void)expected_sha256;
-    (void)staging_dir;
-    (void)actual_sha256_out;
-    resolver_unsupported(error_buffer, error_capacity);
-    return false;
-}
-
-bool gpm_fetch_text_url(const char *url, char **out_text,
-                        char *error_buffer, size_t error_capacity) {
-    (void)url;
-    *out_text = NULL;
-    resolver_unsupported(error_buffer, error_capacity);
-    return false;
-}
-
-bool gpm_fetch_package_signature(const GpmSource *source,
-                                 const char *commit,
-                                 const char *staging_dir,
-                                 char **envelope_out,
-                                 char *error_buffer,
-                                 size_t error_capacity) {
-    (void)source;
-    (void)commit;
-    (void)staging_dir;
-    (void)error_buffer;
-    (void)error_capacity;
-    *envelope_out = NULL;
-    return true;
-}
-
-#endif /* !_WIN32 */
